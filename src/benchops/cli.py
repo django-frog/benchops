@@ -1,18 +1,12 @@
 """CLI entry point for benchops."""
 
-import os
-import subprocess
-import tempfile
-from pathlib import Path
-
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from benchops.auth import AuthManager
 from benchops.config import ConfigManager
-from benchops.runner import LocalRunner, RemoteConnectionError, RemoteRunner
-from benchops.sync import create_tarball, extract_and_cleanup, transfer_tarball
+from benchops.deploy import DeployCommand
 
 app = typer.Typer(
     name="benchops",
@@ -23,16 +17,6 @@ server_app = typer.Typer(help="Manage configured remote servers.")
 app.add_typer(server_app, name="server")
 
 console = Console()
-
-
-def _resolve_app_dir(app_name: str) -> Path:
-    cwd = Path.cwd()
-    for candidate in (cwd / "apps" / app_name, Path(app_name)):
-        if candidate.is_dir():
-            return candidate
-    raise FileNotFoundError(
-        f"Local app directory '{app_name}' not found (looked in '{cwd / 'apps'}' and '{cwd}')."
-    )
 
 
 @app.command()
@@ -62,19 +46,29 @@ def list_servers() -> None:
     if not servers:
         console.print("[yellow]No servers configured yet. Run 'benchops server add' to add one.[/yellow]")
         return
+
     table = Table(title="Configured Servers")
     table.add_column("Alias", style="bold cyan", no_wrap=True)
     table.add_column("Host")
     table.add_column("Port")
     table.add_column("User")
     table.add_column("Bench Path")
+    table.add_column("Post Commands")
+
     for alias, config in sorted(servers.items()):
+        post_cmds = config.get("post_commands")
+        if isinstance(post_cmds, list) and post_cmds:
+            cmds_display = "\n".join(post_cmds)
+        else:
+            cmds_display = "[dim]None[/dim]"
+
         table.add_row(
             alias,
-            config["host"],
-            str(config["port"]),
-            config["user"],
-            config["bench_path"],
+            config.get("host", ""),
+            str(config.get("port", "")),
+            config.get("user", ""),
+            config.get("bench_path", ""),
+            cmds_display,
         )
     console.print(table)
 
@@ -113,65 +107,25 @@ def set_auth(
         console.print(f"[green]Private key path saved for server '{alias}'.[/green]")
 
 
+@server_app.command("remove")
+def remove_server(
+    alias: str = typer.Argument(..., help="Alias of the configured server to remove."),
+) -> None:
+    """Remove a configured server."""
+    try:
+        ConfigManager().remove_server(alias)
+        AuthManager().delete_password(alias)
+        console.print(f"[green]Server '{alias}' has been removed from the configuration.[/green]")
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+
+
 @app.command("deploy")
 def deploy(
     app_name: str = typer.Argument(..., help="Name of the local Frappe app directory to sync."),
     server_alias: str = typer.Argument(..., help="Alias of the target server."),
 ) -> None:
     """Deploy a local Frappe app to a remote server."""
-    config = ConfigManager().get_server(server_alias)
-    if config is None:
-        console.print(f"[red]Error: Server '{server_alias}' not found in configuration.[/red]")
-        raise typer.Exit(1)
-
-    try:
-        password = AuthManager().get_password(server_alias)
-    except Exception:
-        password = None
-    key_path = config.get("private_key_path")
-
-    if not password and not key_path:
-        console.print(
-            f"[red]Error: No authentication configured for server '{server_alias}'. "
-            "Run 'benchops server set-auth' first.[/red]"
-        )
-        raise typer.Exit(1)
-
-    remote_runner = RemoteRunner(
-        host=config["host"],
-        port=int(config["port"]),
-        user=config["user"],
-        password=password,
-        key_path=key_path,
-    )
-    local_runner = LocalRunner()
-
-    try:
-        app_dir = _resolve_app_dir(app_name)
-        console.print("[yellow]Starting local builds...[/yellow]")
-        local_runner.run(["bench", "build", "--app", app_name], cwd=str(app_dir.parent))
-
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tarball = create_tarball(str(app_dir), os.path.join(tmp_dir, f"{app_name}.tar.gz"))
-            console.print(f"[green]Created tarball: {tarball}[/green]")
-
-            console.print(
-                f"[yellow]Connecting to {config['user']}@{config['host']}:{config['port']}...[/yellow]"
-            )
-            remote_dest_dir = f"{config['bench_path']}/apps"
-            remote_tar_path = transfer_tarball(remote_runner, tarball, remote_dest_dir)
-            console.print(f"[green]Transferred tarball to {remote_tar_path}[/green]")
-
-            extract_and_cleanup(remote_runner, remote_tar_path, remote_dest_dir)
-            console.print("[green]Extracted on remote server.[/green]")
-
-        console.print("[yellow]Starting remote operations...[/yellow]")
-        remote_runner.run("bench --site all migrate", cwd=config["bench_path"])
-        remote_runner.run("bench clear-cache", cwd=config["bench_path"])
-
-        console.print(f"[green]Successfully deployed '{app_name}' to '{server_alias}'.[/green]")
-    except (subprocess.CalledProcessError, RemoteConnectionError, FileNotFoundError) as exc:
-        console.print(f"[red]Deployment failed: {exc}[/red]")
-        raise typer.Exit(1)
-    finally:
-        remote_runner.close()
+    command = DeployCommand(app_name, server_alias)
+    command.execute()
