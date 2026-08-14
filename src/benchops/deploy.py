@@ -1,6 +1,7 @@
 """Deployment command logic."""
 
 import os
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -19,9 +20,10 @@ console = Console()
 class DeployCommand:
     """Encapsulates the deployment pipeline logic."""
 
-    def __init__(self, app_name: str, server_alias: str) -> None:
+    def __init__(self, app_name: str, server_alias: str, site: str | None = None) -> None:
         self.app_name = app_name
         self.server_alias = server_alias
+        self.site = site
         self.config = ConfigManager()
         self.auth = AuthManager()
 
@@ -34,6 +36,17 @@ class DeployCommand:
         raise FileNotFoundError(
             f"Local app directory '{self.app_name}' not found (looked in '{cwd / 'apps'}' and '{cwd}')."
         )
+
+    def _interpolate_cmd(self, cmd: str) -> str:
+        """Replace the {site} placeholder in a command with the target site."""
+        if "{site}" not in cmd:
+            return cmd
+        if self.site is None:
+            console.print(
+                f"[red]Error: Command '{cmd}' requires a --site argument, but none was provided.[/red]"
+            )
+            raise typer.Exit(1)
+        return cmd.replace("{site}", self.site)
 
     def execute(self) -> None:
         """Execute the full deployment pipeline."""
@@ -67,8 +80,11 @@ class DeployCommand:
 
         try:
             app_dir = self._resolve_app_dir()
-            console.print("[yellow]Starting local builds...[/yellow]")
-            local_runner.run(["bench", "build", "--app", self.app_name], cwd=str(app_dir.parent))
+            console.print("[yellow]Starting local pre-deploy commands...[/yellow]")
+            pre_local_commands = server_config.get("pre_local_commands", [])
+            for cmd in pre_local_commands:
+                console.print(f"[cyan]Executing: {cmd}[/cyan]")
+                local_runner.run(shlex.split(cmd), cwd=str(app_dir.parent))
 
             with tempfile.TemporaryDirectory() as tmp_dir:
                 tarball = create_tarball(str(app_dir), os.path.join(tmp_dir, f"{self.app_name}.tar.gz"))
@@ -77,6 +93,12 @@ class DeployCommand:
                 console.print(
                     f"[yellow]Connecting to {server_config['user']}@{server_config['host']}:{server_config['port']}...[/yellow]"
                 )
+                pre_remote_commands = server_config.get("pre_remote_commands", [])
+                for cmd in pre_remote_commands:
+                    cmd = self._interpolate_cmd(cmd)
+                    console.print(f"[cyan]Executing: {cmd}[/cyan]")
+                    remote_runner.run(cmd, cwd=server_config["bench_path"])
+
                 remote_dest_dir = f"{server_config['bench_path']}/apps"
                 remote_tar_path = transfer_tarball(remote_runner, tarball, remote_dest_dir)
                 console.print(f"[green]Transferred tarball to {remote_tar_path}[/green]")
@@ -84,9 +106,10 @@ class DeployCommand:
                 extract_and_cleanup(remote_runner, remote_tar_path, remote_dest_dir)
                 console.print("[green]Extracted on remote server.[/green]")
 
-            console.print("[yellow]Starting remote operations...[/yellow]")
-            post_commands = server_config.get("post_commands", [])
-            for cmd in post_commands:
+            console.print("[yellow]Starting remote post-deploy commands...[/yellow]")
+            post_remote_commands = server_config.get("post_remote_commands", [])
+            for cmd in post_remote_commands:
+                cmd = self._interpolate_cmd(cmd)
                 console.print(f"[cyan]Executing: {cmd}[/cyan]")
                 remote_runner.run(cmd, cwd=server_config["bench_path"])
 

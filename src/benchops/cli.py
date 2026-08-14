@@ -19,6 +19,13 @@ app.add_typer(server_app, name="server")
 console = Console()
 
 
+def _render_hook_count(config: dict, key: str) -> str:
+    commands = config.get(key) or []
+    if commands:
+        return f"[green]{len(commands)} cmds[/green]"
+    return "[dim]None[/dim]"
+
+
 @app.command()
 def init() -> None:
     """Initialize the benchops configuration."""
@@ -53,22 +60,20 @@ def list_servers() -> None:
     table.add_column("Port")
     table.add_column("User")
     table.add_column("Bench Path")
-    table.add_column("Post Commands")
+    table.add_column("Pre-Local", justify="center")
+    table.add_column("Pre-Remote", justify="center")
+    table.add_column("Post-Remote", justify="center")
 
     for alias, config in sorted(servers.items()):
-        post_cmds = config.get("post_commands")
-        if isinstance(post_cmds, list) and post_cmds:
-            cmds_display = "\n".join(post_cmds)
-        else:
-            cmds_display = "[dim]None[/dim]"
-
         table.add_row(
             alias,
             config.get("host", ""),
             str(config.get("port", "")),
             config.get("user", ""),
             config.get("bench_path", ""),
-            cmds_display,
+            _render_hook_count(config, "pre_local_commands"),
+            _render_hook_count(config, "pre_remote_commands"),
+            _render_hook_count(config, "post_remote_commands"),
         )
     console.print(table)
 
@@ -125,7 +130,8 @@ def remove_server(
 def deploy(
     app_name: str = typer.Argument(..., help="Name of the local Frappe app directory to sync."),
     server_alias: str = typer.Argument(..., help="Alias of the target server."),
+    site: str | None = typer.Option(None, help="Specific site to target for remote commands (e.g., test-16.akwad.qa)."),
 ) -> None:
     """Deploy a local Frappe app to a remote server."""
-    command = DeployCommand(app_name, server_alias)
+    command = DeployCommand(app_name, server_alias, site)
     command.execute()

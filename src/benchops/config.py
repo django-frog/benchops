@@ -35,7 +35,9 @@ class ConfigManager:
         user: str,
         bench_path: str,
         private_key_path: str | None = None,
-        post_commands: list[str] | None = None,
+        pre_local_commands: list[str] | None = None,
+        pre_remote_commands: list[str] | None = None,
+        post_remote_commands: list[str] | None = None,
     ) -> None:
         """Add or update a server, preserving existing comments and formatting."""
         self.init_config()
@@ -49,11 +51,16 @@ class ConfigManager:
         entry["bench_path"] = bench_path
         if private_key_path is not None:
             entry["private_key_path"] = private_key_path
-        if post_commands is not None:
-            array = tomlkit.array()
-            for cmd in post_commands:
-                array.append(cmd)
-            entry["post_commands"] = array
+        for hook, commands in (
+            ("pre_local_commands", pre_local_commands),
+            ("pre_remote_commands", pre_remote_commands),
+            ("post_remote_commands", post_remote_commands),
+        ):
+            if commands is not None:
+                array = tomlkit.array()
+                for cmd in commands:
+                    array.append(cmd)
+                entry[hook] = array
 
         doc["servers"][alias] = entry
         TOMLFile(self.config_path).write(doc)
