@@ -5,9 +5,9 @@ A robust Command Line Interface (CLI) tool designed to streamline and synchroniz
 ## Features
 
 * **Automated Code Syncing:** Compresses your local Frappe app into a tarball, transfers it securely via SFTP, and extracts it directly into the remote bench, replacing manual SSH copying.
-* **Extensible Lifecycle Hooks:** Define custom shell commands to execute at specific stages of the deployment pipeline (`pre-local`, `pre-remote`, `post-remote`).
+* **Extensible Lifecycle Hooks:** Define custom shell commands to execute at specific stages of the deployment pipeline (`pre-local`, `pre-remote`, `post-remote`, `install-remote`, `uninstall-remote`).
 * **Embedded Multiline Editor:** Write and manage your deployment scripts directly in the terminal using a built-in interactive editor (powered by `prompt_toolkit`).
-* **Dynamic Site Target Resolution:** Use the `{site}` placeholder in your hook configurations to dynamically target specific Frappe tenant environments during deployment.
+* **Dynamic Target Resolution:** Use the `{site}` and `{app}` placeholders in your hook configurations to dynamically target specific Frappe tenant environments and applications during execution.
 * **Secure Credential Management:** Store authentication methods locally, supporting both SSH private keys and passwords securely.
 
 ## Installation
@@ -53,53 +53,64 @@ benchops server set-auth staging
 
 ```
 
-## Managing Deployment Hooks
+## Managing Hooks and Placeholders
 
-BenchOps allows you to define custom actions that run before, during, and after your deployment. Instead of editing configuration files manually, use the built-in embedded editor to write your scripts.
+BenchOps allows you to define custom actions that run before, during, and after your deployment, as well as one-time installation actions. Use the built-in embedded editor to write your scripts.
+
+**Dynamic Placeholders:**
+You can write generic hooks that apply to any deployment by using these placeholders:
+
+* `{site}`: Automatically replaced by the `--site` flag passed in the CLI.
+* `{app}`: Automatically replaced by the local app name passed in the CLI.
 
 **Available Lifecycle Phases:**
 
 * `pre-local`: Runs on your local machine before archiving (e.g., compiling assets).
 * `pre-remote`: Runs on the remote server before the new code is extracted (e.g., enabling maintenance mode).
 * `post-remote`: Runs on the remote server after extraction (e.g., database migrations, clearing cache).
+* `install-remote`: Runs exactly once when using the `install` command (e.g., `bench --site {site} install-app {app}`).
+* `uninstall-remote`: Runs exactly once when using the `uninstall` command (e.g., `bench --site {site} uninstall-app {app}`).
 
 **Editing Hooks:**
 Open the interactive terminal editor for a specific phase:
 
 ```bash
-benchops server edit-hooks staging pre-local
+benchops server edit-hooks staging install-remote
 
 ```
 
 *(Press `Esc` then `Enter` to save and exit the editor).*
 
-**Viewing Configurations:**
-To see an overview of your configured servers and the number of hooks attached to each phase:
+## Executing Commands
 
-```bash
-benchops server list
+By passing the optional `--site` flag to the core commands, BenchOps will automatically resolve the placeholders in your hooks.
 
-```
+### Deploying an Application
 
-## Deploying an Application
-
-Execute the deployment pipeline from inside your local bench (or `apps` directory).
-
-By passing the optional `--site` flag, BenchOps will automatically resolve the `{site}` placeholder in any of your remote hooks to target a specific tenant environment.
+Synchronize your local code and run the deployment hooks (`pre-local`, `pre-remote`, `post-remote`):
 
 ```bash
 benchops deploy custom_app staging --site test-16.akwad.qa
 
 ```
 
-**Deployment Pipeline Flow:**
+### Installing an Application (One-Time)
 
-1. Executes `pre-local` hooks (e.g., `bench build --app custom_app`).
-2. Archives the local app directory into a `.tar.gz` payload.
-3. Connects via SSH and executes `pre-remote` hooks.
-4. Transfers the tarball via SFTP and extracts it into the remote bench's `apps/` directory.
-5. Executes `post-remote` hooks with dynamic site interpolation (e.g., `bench --site test-16.akwad.qa migrate`).
-6. Cleans up temporary artifacts and closes connections safely.
+Run the isolated `install-remote` hooks for a brand new application:
+
+```bash
+benchops install custom_app staging --site test-16.akwad.qa
+
+```
+
+### Uninstalling an Application (One-Time)
+
+Run the isolated `uninstall-remote` hooks to remove an application from a site:
+
+```bash
+benchops uninstall custom_app staging --site test-16.akwad.qa
+
+```
 
 ## CLI Command Reference
 
@@ -107,6 +118,8 @@ benchops deploy custom_app staging --site test-16.akwad.qa
 
 * `benchops init`: Initializes the BenchOps configuration.
 * `benchops deploy <app_name> <server_alias> [--site <site_name>]`: Deploys a local Frappe app to a remote server.
+* `benchops install <app_name> <server_alias> --site <site_name>`: Executes the install-remote hooks.
+* `benchops uninstall <app_name> <server_alias> --site <site_name>`: Executes the uninstall-remote hooks.
 
 ### Server Management (`benchops server`)
 
