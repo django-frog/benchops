@@ -116,8 +116,14 @@ def set_auth(
         console.print(f"[green]Password saved for server '{alias}'.[/green]")
     else:
         key_path = typer.prompt("Absolute path to the SSH private key", default="~/.ssh/id_rsa")
+
+        expanded_path = Path(key_path).expanduser()
+        if not expanded_path.is_file():
+            console.print(f"[red]Error: '{key_path}' is not a valid file. Please point directly to the private key file (e.g., ~/.ssh/id_rsa).[/red]")
+            raise typer.Exit(1)
+
         try:
-            config.update_server_key(alias, key_path)
+            config.update_server_key(alias, str(expanded_path))
         except ValueError as exc:
             console.print(f"[red]Error: {exc}[/red]")
             raise typer.Exit(1)
