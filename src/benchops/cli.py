@@ -12,6 +12,8 @@ from rich.table import Table
 from benchops.auth import AuthManager
 from benchops.config import ConfigManager
 from benchops.deploy import DeployCommand
+from benchops.install import InstallCommand
+from benchops.uninstall import UninstallCommand
 
 
 class HookPhase(str, Enum):
@@ -19,6 +21,8 @@ class HookPhase(str, Enum):
     pre_local = "pre-local"
     pre_remote = "pre-remote"
     post_remote = "post-remote"
+    install_remote = "install-remote"
+    uninstall_remote = "uninstall-remote"
 
 
 app = typer.Typer(
@@ -76,6 +80,8 @@ def list_servers() -> None:
     table.add_column("Pre-Local", justify="center")
     table.add_column("Pre-Remote", justify="center")
     table.add_column("Post-Remote", justify="center")
+    table.add_column("Install-Remote", justify="center")
+    table.add_column("Uninstall-Remote", justify="center")
 
     for alias, config in sorted(servers.items()):
         table.add_row(
