@@ -87,6 +87,8 @@ def list_servers() -> None:
             _render_hook_count(config, "pre_local_commands"),
             _render_hook_count(config, "pre_remote_commands"),
             _render_hook_count(config, "post_remote_commands"),
+            _render_hook_count(config, "install_remote_commands"),
+            _render_hook_count(config, "uninstall_remote_commands"),
         )
     console.print(table)
 
@@ -228,3 +230,32 @@ def edit_hooks(
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1)
+
+
+@app.command("install")
+def install(
+    app_name: str = typer.Argument(..., help="Name of the local Frappe app."),
+    server_alias: str = typer.Argument(..., help="Alias of the target server."),
+    site: str = typer.Option(
+        ...,
+        prompt="Target site",
+        help="Specific site to install the app on (e.g., test-16.akwad.qa)."
+    ),
+) -> None:
+    """Execute one-time installation hooks for a Frappe app on a remote server."""
+    command = InstallCommand(app_name, server_alias, site)
+    command.execute()
+
+@app.command("uninstall")
+def uninstall(
+    app_name: str = typer.Argument(..., help="Name of the local Frappe app."),
+    server_alias: str = typer.Argument(..., help="Alias of the target server."),
+    site: str = typer.Option(
+        ...,
+        prompt="Target site",
+        help="Specific site to uninstall the app from (e.g., test-16.akwad.qa)."
+    ),
+) -> None:
+    """Execute one-time uninstallation hooks for a Frappe app on a remote server."""
+    command = UninstallCommand(app_name, server_alias, site)
+    command.execute()

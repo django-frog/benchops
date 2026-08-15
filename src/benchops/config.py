@@ -56,6 +56,8 @@ class ConfigManager:
         pre_local_commands: list[str] | None = None,
         pre_remote_commands: list[str] | None = None,
         post_remote_commands: list[str] | None = None,
+        install_remote_commands: list[str] | None = None,
+        uninstall_remote_commands: list[str] | None = None,
     ) -> None:
         """Add or update a server, preserving existing comments and formatting."""
         alias = alias.strip()
@@ -77,6 +79,8 @@ class ConfigManager:
             ("pre_local_commands", pre_local_commands),
             ("pre_remote_commands", pre_remote_commands),
             ("post_remote_commands", post_remote_commands),
+            ("install_remote_commands", install_remote_commands),
+            ("uninstall_remote_commands", uninstall_remote_commands),
         ):
             if commands is not None:
                 array = tomlkit.array()
