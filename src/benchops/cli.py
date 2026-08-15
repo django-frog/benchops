@@ -1,12 +1,24 @@
 """CLI entry point for benchops."""
 
+from enum import Enum
+
 import typer
+from prompt_toolkit import prompt
+from prompt_toolkit.formatted_text import HTML
 from rich.console import Console
 from rich.table import Table
 
 from benchops.auth import AuthManager
 from benchops.config import ConfigManager
 from benchops.deploy import DeployCommand
+
+
+class HookPhase(str, Enum):
+    """Lifecycle phases for command hooks."""
+    pre_local = "pre-local"
+    pre_remote = "pre-remote"
+    post_remote = "post-remote"
+
 
 app = typer.Typer(
     name="benchops",
@@ -135,3 +147,77 @@ def deploy(
     """Deploy a local Frappe app to a remote server."""
     command = DeployCommand(app_name, server_alias, site)
     command.execute()
+
+
+@server_app.command("add-hook")
+def add_hook(
+    alias: str = typer.Argument(..., help="Alias of the configured server."),
+    phase: HookPhase = typer.Argument(..., help="The lifecycle phase to attach the command to."),
+    cmd: str = typer.Argument(..., help="The command string to execute (enclose in quotes)."),
+) -> None:
+    """Add a lifecycle command hook to a server."""
+    try:
+        ConfigManager().add_hook(alias, phase.value, cmd)
+        console.print(f"[green]Successfully added command to {phase.value} hooks for '{alias}'.[/green]")
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+
+
+@server_app.command("clear-hooks")
+def clear_hooks(
+    alias: str = typer.Argument(..., help="Alias of the configured server."),
+    phase: HookPhase = typer.Argument(..., help="The lifecycle phase to clear hooks from."),
+) -> None:
+    """Clear all lifecycle command hooks for a specific phase."""
+    try:
+        ConfigManager().clear_hooks(alias, phase.value)
+        console.print(f"[green]Successfully cleared {phase.value} hooks for '{alias}'.[/green]")
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+
+
+@server_app.command("edit-hooks")
+def edit_hooks(
+    alias: str = typer.Argument(..., help="Alias of the configured server."),
+    phase: HookPhase = typer.Argument(..., help="The lifecycle phase to edit."),
+) -> None:
+    """Open an embedded multiline editor to write commands."""
+    config_mgr = ConfigManager()
+
+    try:
+        existing_commands = config_mgr.get_hooks(alias, phase.value)
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+
+    initial_text = "\n".join(existing_commands)
+    if initial_text:
+        initial_text += "\n"
+
+    console.print(f"[cyan]Editing {phase.value} hooks for '{alias}'...[/cyan]")
+
+    try:
+        edited_text = prompt(
+            "",
+            default=initial_text,
+            multiline=True,
+            bottom_toolbar=HTML(" Press <b>[Esc]</b> then <b>[Enter]</b> to save | <b>[Ctrl+C]</b> to cancel "),
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Edit cancelled. No changes were made.[/yellow]")
+        return
+
+    new_commands = []
+    for line in edited_text.splitlines():
+        cleaned_line = line.strip()
+        if cleaned_line and not cleaned_line.startswith("#"):
+            new_commands.append(cleaned_line)
+
+    try:
+        config_mgr.set_hooks(alias, phase.value, new_commands)
+        console.print(f"[green]Successfully saved {len(new_commands)} commands to {phase.value} hooks for '{alias}'.[/green]")
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
