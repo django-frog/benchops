@@ -1,156 +1,119 @@
-# benchops
+# BenchOps
 
-A cross-platform CLI tool that synchronizes local Frappe development
-environments with remote servers.
-
-`benchops` automates the repetitive "ship my app to the server" workflow: it
-builds your app locally, packages it into a compressed archive, uploads it to
-the target server over SSH, extracts it into the remote bench, and runs the
-Frappe housekeeping commands to apply the changes — all with output streamed to
-your terminal in real time.
+A robust Command Line Interface (CLI) tool designed to streamline and synchronize local Frappe development environments with remote servers. BenchOps automates the deployment pipeline, offering extensible lifecycle command hooks, automated archiving, SFTP transfers, and dynamic multi-site target resolution.
 
 ## Features
 
-- **Server management** — define remote servers in a local TOML config
-  (`~/.benchops/config.toml`) with a friendly interactive CLI.
-- **Secure authentication** — store server passwords in your OS credential
-  store (`keyring`) or use an SSH private key.
-- **Real-time streaming** — every local and remote command streams its stdout
-  and stderr to your terminal as it runs.
-- **Lean transfers** — source tarballs exclude `.git`, `__pycache__`,
-  `node_modules`, and `*.pyc` to keep uploads small.
-- **One-command deploy** — build, archive, upload, extract, migrate, and clear
-  cache with a single invocation.
-
-## Requirements
-
-- Python `>= 3.14.6`
-- [uv](https://docs.astral.sh/uv/) (recommended) or `pip`
-- SSH access to the target server (password or key)
+* **Automated Code Syncing:** Compresses your local Frappe app into a tarball, transfers it securely via SFTP, and extracts it directly into the remote bench, replacing manual SSH copying.
+* **Extensible Lifecycle Hooks:** Define custom shell commands to execute at specific stages of the deployment pipeline (`pre-local`, `pre-remote`, `post-remote`).
+* **Embedded Multiline Editor:** Write and manage your deployment scripts directly in the terminal using a built-in interactive editor (powered by `prompt_toolkit`).
+* **Dynamic Site Target Resolution:** Use the `{site}` placeholder in your hook configurations to dynamically target specific Frappe tenant environments during deployment.
+* **Secure Credential Management:** Store authentication methods locally, supporting both SSH private keys and passwords securely.
 
 ## Installation
 
-```bash
-git clone <your-repo-url> benchops
-cd benchops
-uv sync
-```
-
-Install the CLI into your environment so the `benchops` command is available:
+BenchOps is built with Python and utilizes `uv` for fast package management. You can install it globally using `uv tool`:
 
 ```bash
-uv run pip install -e .
-# or, if you built a distribution:
-uv build && uv pip install --python .venv/bin/python dist/benchops-0.1.0-py3-none-any.whl
+uv tool install benchops
+
 ```
 
-Verify it works:
+## Getting Started
 
-```bash
-benchops --help
-```
+### 1. Initialize the Configuration
 
-## Quick start
-
-### 1. Initialize the configuration
+Bootstrap the local configuration structure (`~/.benchops/config.toml`):
 
 ```bash
 benchops init
+
 ```
 
-This creates `~/.benchops/config.toml` with an empty `[servers]` table.
+### 2. Register a Remote Server
 
-### 2. Register a server
+Add your target remote server environment (e.g., a staging server):
 
 ```bash
-benchops server add
+benchops server add \
+  --alias staging \
+  --host 3.7.212.100 \
+  --port 22 \
+  --user akwad \
+  --bench-path /home/akwad/dev-bench-03
+
 ```
 
-You will be prompted for:
+### 3. Set Authentication
 
-| Field       | Description                              |
-| ----------- | ---------------------------------------- |
-| `alias`     | Short name used to reference the server  |
-| `host`      | Hostname or IP address                   |
-| `port`      | SSH port (default: `22`)                 |
-| `user`      | SSH username                             |
-| `bench_path`| Remote path to the bench directory       |
-
-You can also pass everything non-interactively:
+Securely link your local SSH private key (or password) for authentication:
 
 ```bash
-benchops server add --alias dev1 --host 192.168.1.10 --port 22 --user frappe --bench-path /home/frappe/bench
+benchops server set-auth staging
+
 ```
 
-List your configured servers:
+## Managing Deployment Hooks
+
+BenchOps allows you to define custom actions that run before, during, and after your deployment. Instead of editing configuration files manually, use the built-in embedded editor to write your scripts.
+
+**Available Lifecycle Phases:**
+
+* `pre-local`: Runs on your local machine before archiving (e.g., compiling assets).
+* `pre-remote`: Runs on the remote server before the new code is extracted (e.g., enabling maintenance mode).
+* `post-remote`: Runs on the remote server after extraction (e.g., database migrations, clearing cache).
+
+**Editing Hooks:**
+Open the interactive terminal editor for a specific phase:
+
+```bash
+benchops server edit-hooks staging pre-local
+
+```
+
+*(Press `Esc` then `Enter` to save and exit the editor).*
+
+**Viewing Configurations:**
+To see an overview of your configured servers and the number of hooks attached to each phase:
 
 ```bash
 benchops server list
+
 ```
 
-### 3. Configure authentication
+## Deploying an Application
+
+Execute the deployment pipeline from inside your local bench (or `apps` directory).
+
+By passing the optional `--site` flag, BenchOps will automatically resolve the `{site}` placeholder in any of your remote hooks to target a specific tenant environment.
 
 ```bash
-benchops server set-auth dev1
+benchops deploy custom_app staging --site test-16.akwad.qa
+
 ```
 
-You will be asked to choose between:
+**Deployment Pipeline Flow:**
 
-- **`password`** — prompted securely (hidden input, double confirmation) and
-  stored in your system keyring.
-- **`key`** — path to your SSH private key (default `~/.ssh/id_rsa`), stored in
-  the server's configuration.
+1. Executes `pre-local` hooks (e.g., `bench build --app custom_app`).
+2. Archives the local app directory into a `.tar.gz` payload.
+3. Connects via SSH and executes `pre-remote` hooks.
+4. Transfers the tarball via SFTP and extracts it into the remote bench's `apps/` directory.
+5. Executes `post-remote` hooks with dynamic site interpolation (e.g., `bench --site test-16.akwad.qa migrate`).
+6. Cleans up temporary artifacts and closes connections safely.
 
-### 4. Deploy
+## CLI Command Reference
 
-Run `benchops deploy` from the directory that contains your app (either inside
-the local bench's `apps/` folder or directly):
+### Global Commands
 
-```bash
-benchops deploy <app_name> <server_alias>
-```
+* `benchops init`: Initializes the BenchOps configuration.
+* `benchops deploy <app_name> <server_alias> [--site <site_name>]`: Deploys a local Frappe app to a remote server.
 
-For example:
+### Server Management (`benchops server`)
 
-```bash
-benchops deploy myapp dev1
-```
-
-The deploy pipeline:
-
-1. **Config & auth** — loads the server settings and its credentials.
-2. **Local build** — runs `bench build --app <app_name>` in the app's parent
-   directory.
-3. **Archive** — compresses `<app_name>` into a `.tar.gz` (excluding `.git`,
-   `__pycache__`, `node_modules`, and `*.pyc`) in a temporary directory.
-4. **Connect** — opens an SSH connection to the server.
-5. **Transfer & extract** — uploads the tarball and extracts it into
-   `{bench_path}/apps`.
-6. **Remote operations** — runs `bench --site all migrate` and
-   `bench clear-cache` inside `{bench_path}`.
-7. **Cleanup** — closes the connection and reports success.
-
-## Configuration
-
-All server definitions live in `~/.benchops/config.toml`:
-
-```toml
-[servers]
-dev1 = {host = "192.168.1.10", port = 22, user = "frappe", bench_path = "/home/frappe/bench", private_key_path = "/home/mohammad/.ssh/id_rsa"}
-staging = {host = "staging.example.com", port = 22, user = "deploy", bench_path = "/srv/bench"}
-```
-
-Passwords are **not** stored in this file — they are kept in the operating
-system's credential store via `keyring`.
-
-## Development
-
-```bash
-uv sync            # install dependencies
-uv build           # build wheel + sdist
-uv publish         # upload to PyPI (set UV_PUBLISH_TOKEN first)
-```
-
-## License
-
-MIT
+* `add`: Interactively add or update a remote server profile.
+* `list`: Display a table of all configured servers and hook counts.
+* `set-auth <alias>`: Configure SSH key or password authentication.
+* `remove <alias>`: Delete a server profile and its credentials.
+* `edit-hooks <alias> <phase>`: Open the multiline editor to define lifecycle commands.
+* `add-hook <alias> <phase> <cmd>`: Quickly append a single command to a hook phase.
+* `clear-hooks <alias> <phase>`: Wipe all commands for a specific lifecycle phase.
