@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 import typer
+from invoke.exceptions import UnexpectedExit
 from rich.console import Console
 
 from benchops.auth import AuthManager
@@ -115,7 +116,12 @@ class DeployCommand:
 
             console.print(f"[green]Successfully deployed '{self.app_name}' to '{self.server_alias}'.[/green]")
 
-        except (subprocess.CalledProcessError, RemoteConnectionError, FileNotFoundError) as exc:
+        except (
+            subprocess.CalledProcessError,
+            RemoteConnectionError,
+            FileNotFoundError,
+            UnexpectedExit
+        ) as exc:
             console.print(f"[red]Deployment failed: {exc}[/red]")
             raise typer.Exit(1)
         finally:
