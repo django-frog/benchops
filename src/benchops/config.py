@@ -29,6 +29,7 @@ class ConfigManager:
 
     def _get_server_entry(self, alias: str) -> tuple[tomlkit.TOMLDocument, dict]:
         """Helper to load config, validate server exists, and return the doc and server table."""
+        alias = alias.strip()
         try:
             doc = self._read()
         except FileNotFoundError:
@@ -57,6 +58,7 @@ class ConfigManager:
         post_remote_commands: list[str] | None = None,
     ) -> None:
         """Add or update a server, preserving existing comments and formatting."""
+        alias = alias.strip()
         self.init_config()
         doc = self._read()
         if "servers" not in doc:
@@ -105,7 +107,7 @@ class ConfigManager:
         servers = doc.get("servers")
         if servers is None:
             return {}
-        return {str(alias): dict(config) for alias, config in servers.items()}
+        return {str(alias).strip(): dict(config) for alias, config in servers.items()}
 
     def remove_server(self, alias: str) -> None:
         """Remove a server from the configuration."""

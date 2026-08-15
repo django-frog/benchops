@@ -1,6 +1,7 @@
 """CLI entry point for benchops."""
 
 from enum import Enum
+from pathlib import Path
 
 import typer
 from prompt_toolkit import prompt
