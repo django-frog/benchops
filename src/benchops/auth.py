@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from benchops.runner import BenchOpsConnectionError
+from benchops.security import secure_file
 
 SERVICE_NAME = "benchops"
 
@@ -66,7 +67,7 @@ class AuthManager:
         server doesn't invalidate trust already established on other hosts.
         """
         KEYS_DIR.mkdir(parents=True, exist_ok=True)
-        KEYS_DIR.chmod(0o700)
+        secure_file(KEYS_DIR, 0o700)
 
         private_path = KEYS_DIR / key_name
         public_path = KEYS_DIR / f"{key_name}.pub"
@@ -86,7 +87,7 @@ class AuthManager:
         )
 
         private_path.write_bytes(private_bytes)
-        private_path.chmod(0o600)
+        secure_file(private_path, 0o600)
         public_path.write_bytes(public_bytes + f" {key_name}\n".encode())
         public_path.chmod(0o644)
 

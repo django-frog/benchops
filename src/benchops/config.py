@@ -5,6 +5,8 @@ from pathlib import Path
 import tomlkit
 from tomlkit.toml_file import TOMLFile
 
+from benchops.security import secure_file
+
 CONFIG_PATH = Path.home() / ".benchops" / "config.toml"
 
 DEFAULT_CONNECTION_TYPE = "ssh"
@@ -26,7 +28,7 @@ class ConfigManager:
         doc = tomlkit.document()
         doc["servers"] = tomlkit.table()
         TOMLFile(self.config_path).write(doc)
-        self.config_path.chmod(0o600)
+        secure_file(self.config_path, 0o600)
 
     def _read(self) -> tomlkit.TOMLDocument:
         return TOMLFile(self.config_path).read()
