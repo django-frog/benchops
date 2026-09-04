@@ -9,7 +9,7 @@ from prompt_toolkit.formatted_text import HTML
 from rich.console import Console
 from rich.table import Table
 
-from benchops.auth import AuthManager
+from benchops.auth import AuthManager, KeyringUnavailableError
 from benchops.config import ConfigManager
 from benchops.deploy import DeployCommand
 from benchops.install import InstallCommand
@@ -23,6 +23,12 @@ class HookPhase(str, Enum):
     post_remote = "post-remote"
     install_remote = "install-remote"
     uninstall_remote = "uninstall-remote"
+
+
+class ConnectionType(str, Enum):
+    """Supported transports for reaching a configured server."""
+    ssh = "ssh"
+    ssm = "ssm"
 
 
 app = typer.Typer(
@@ -57,9 +63,40 @@ def add_server(
     port: int = typer.Option(22, prompt="SSH port", help="SSH port (default: 22)."),
     user: str = typer.Option(..., prompt="SSH user", help="SSH username."),
     bench_path: str = typer.Option(..., prompt="Remote bench path", help="Path to the bench directory on the server."),
+    connection_type: ConnectionType = typer.Option(
+        ConnectionType.ssh,
+        prompt="Connection type",
+        help="How benchops should reach this server ('ssh' for direct SSH, 'ssm' for AWS Systems Manager).",
+    ),
+    instance_id: str | None = typer.Option(
+        None, help="EC2 instance ID (only used when connection_type is 'ssm')."
+    ),
+    aws_profile: str | None = typer.Option(
+        None, help="Named AWS CLI profile to use (only used when connection_type is 'ssm')."
+    ),
+    aws_region: str | None = typer.Option(
+        None, help="AWS region the instance lives in (only used when connection_type is 'ssm')."
+    ),
 ) -> None:
     """Add or update a configured server."""
-    ConfigManager().add_server(alias, host, port, user, bench_path)
+    if connection_type == ConnectionType.ssm and not instance_id:
+        instance_id = typer.prompt("EC2 instance ID")
+
+    try:
+        ConfigManager().add_server(
+            alias,
+            host,
+            port,
+            user,
+            bench_path,
+            connection_type=connection_type.value,
+            instance_id=instance_id,
+            aws_profile=aws_profile,
+            aws_region=aws_region,
+        )
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
     console.print(f"[green]Server '{alias}' saved to configuration.[/green]")
 
 
@@ -73,10 +110,12 @@ def list_servers() -> None:
 
     table = Table(title="Configured Servers")
     table.add_column("Alias", style="bold cyan", no_wrap=True)
+    table.add_column("Type")
     table.add_column("Host")
     table.add_column("Port")
     table.add_column("User")
     table.add_column("Bench Path")
+    table.add_column("Instance ID")
     table.add_column("Pre-Local", justify="center")
     table.add_column("Pre-Remote", justify="center")
     table.add_column("Post-Remote", justify="center")
@@ -86,10 +125,12 @@ def list_servers() -> None:
     for alias, config in sorted(servers.items()):
         table.add_row(
             alias,
+            config.get("connection_type", "ssh"),
             config.get("host", ""),
             str(config.get("port", "")),
             config.get("user", ""),
             config.get("bench_path", ""),
+            config.get("instance_id") or "[dim]—[/dim]",
             _render_hook_count(config, "pre_local_commands"),
             _render_hook_count(config, "pre_remote_commands"),
             _render_hook_count(config, "post_remote_commands"),
@@ -115,13 +156,24 @@ def set_auth(
             break
         console.print("[red]Invalid choice. Enter 'password' or 'key'.[/red]")
 
+    auth = AuthManager()
+
     if auth_type == "password":
         password = typer.prompt("Password", hide_input=True, confirmation_prompt=True)
         try:
-            AuthManager().set_password(alias, password)
-        except Exception as exc:
+            auth.set_password(alias, password)
+        except KeyringUnavailableError as exc:
             console.print(f"[red]Error: Failed to save password: {exc}[/red]")
             raise typer.Exit(1)
+
+        # A server should only carry one active credential at a time; drop the
+        # key path so a stale key can't be combined with the new password.
+        try:
+            config.clear_private_key(alias)
+        except ValueError as exc:
+            console.print(f"[red]Error: {exc}[/red]")
+            raise typer.Exit(1)
+
         console.print(f"[green]Password saved for server '{alias}'.[/green]")
     else:
         key_path = typer.prompt("Absolute path to the SSH private key", default="~/.ssh/id_rsa")
@@ -136,6 +188,17 @@ def set_auth(
         except ValueError as exc:
             console.print(f"[red]Error: {exc}[/red]")
             raise typer.Exit(1)
+
+        # Switching to key-based auth: clear any stale password from the
+        # keyring so a future connection can't silently fall back to it.
+        try:
+            auth.delete_password(alias)
+        except KeyringUnavailableError as exc:
+            console.print(
+                f"[yellow]Warning: Could not clear the old password from the system "
+                f"keyring for '{alias}': {exc}[/yellow]"
+            )
+
         console.print(f"[green]Private key path saved for server '{alias}'.[/green]")
 
 
@@ -146,11 +209,19 @@ def remove_server(
     """Remove a configured server."""
     try:
         ConfigManager().remove_server(alias)
-        AuthManager().delete_password(alias)
-        console.print(f"[green]Server '{alias}' has been removed from the configuration.[/green]")
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1)
+
+    console.print(f"[green]Server '{alias}' has been removed from the configuration.[/green]")
+
+    try:
+        AuthManager().delete_password(alias)
+    except KeyringUnavailableError as exc:
+        console.print(
+            f"[yellow]Warning: Could not clear the stored credential from the system "
+            f"keyring for '{alias}': {exc}[/yellow]"
+        )
 
 
 @app.command("deploy")

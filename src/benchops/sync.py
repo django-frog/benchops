@@ -1,9 +1,10 @@
-"""Sync engine: local compression, SFTP transfer, and remote extraction."""
+"""Sync engine: local compression, transfer, and remote extraction."""
 
+import shlex
 import tarfile
 from pathlib import Path
 
-from benchops.runner import RemoteRunner
+from benchops.runner import Runner
 
 
 def _tar_filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
@@ -27,13 +28,15 @@ def create_tarball(app_path: str, output_path: str) -> str:
     return str(out.resolve())
 
 
-def transfer_tarball(runner: RemoteRunner, local_path: str, remote_dest_dir: str) -> str:
-    """Transfer a local tarball to a remote directory over SFTP."""
-    runner.connection.put(local_path, remote_dest_dir)
+def transfer_tarball(runner: Runner, local_path: str, remote_dest_dir: str) -> str:
+    """Transfer a local tarball to a remote directory."""
+    runner.put(local_path, remote_dest_dir)
     return f"{remote_dest_dir.rstrip('/')}/{Path(local_path).name}"
 
 
-def extract_and_cleanup(runner: RemoteRunner, remote_tar_path: str, remote_extract_dir: str) -> None:
+def extract_and_cleanup(runner: Runner, remote_tar_path: str, remote_extract_dir: str) -> None:
     """Extract a remote tarball and remove it afterwards."""
-    runner.run(f"tar -xzf {remote_tar_path} -C {remote_extract_dir}")
-    runner.run(f"rm {remote_tar_path}")
+    tar_path = shlex.quote(remote_tar_path)
+    extract_dir = shlex.quote(remote_extract_dir)
+    runner.run(f"tar -xzf {tar_path} -C {extract_dir}")
+    runner.run(f"rm {tar_path}")

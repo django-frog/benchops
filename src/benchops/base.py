@@ -3,9 +3,9 @@
 import typer
 from rich.console import Console
 
-from benchops.auth import AuthManager
+from benchops.auth import AuthManager, KeyringUnavailableError
 from benchops.config import ConfigManager
-from benchops.runner import RemoteRunner
+from benchops.runner import RemoteRunner, Runner
 
 console = Console()
 
@@ -43,12 +43,29 @@ class BaseCommand:
             raise typer.Exit(1)
         return server_config
 
-    def _get_remote_runner(self, server_config: dict) -> RemoteRunner:
-        """Instantiate an authenticated RemoteRunner."""
+    def _get_remote_runner(self, server_config: dict) -> Runner:
+        """Instantiate an authenticated runner for the server's connection_type.
+
+        Returns the abstract Runner interface rather than a concrete class so
+        that a future SSM-backed implementation can be swapped in here without
+        touching any call site.
+        """
+        connection_type = server_config.get("connection_type", "ssh")
+        if connection_type != "ssh":
+            console.print(
+                f"[red]Error: connection_type '{connection_type}' is configured for "
+                f"'{self.server_alias}', but that connection type is not implemented yet.[/red]"
+            )
+            raise typer.Exit(1)
+
         try:
             password = self.auth.get_password(self.server_alias)
-        except Exception:
-            password = None
+        except KeyringUnavailableError as exc:
+            console.print(
+                f"[red]Error: Could not access the system keyring to retrieve credentials "
+                f"for '{self.server_alias}': {exc}[/red]"
+            )
+            raise typer.Exit(1)
 
         key_path = server_config.get("private_key_path")
 

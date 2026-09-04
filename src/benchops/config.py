@@ -7,6 +7,9 @@ from tomlkit.toml_file import TOMLFile
 
 CONFIG_PATH = Path.home() / ".benchops" / "config.toml"
 
+DEFAULT_CONNECTION_TYPE = "ssh"
+VALID_CONNECTION_TYPES = {"ssh", "ssm"}
+
 
 class ConfigManager:
     """Reads and writes the local benchops TOML configuration file."""
@@ -23,6 +26,7 @@ class ConfigManager:
         doc = tomlkit.document()
         doc["servers"] = tomlkit.table()
         TOMLFile(self.config_path).write(doc)
+        self.config_path.chmod(0o600)
 
     def _read(self) -> tomlkit.TOMLDocument:
         return TOMLFile(self.config_path).read()
@@ -52,7 +56,11 @@ class ConfigManager:
         port: int,
         user: str,
         bench_path: str,
+        connection_type: str = DEFAULT_CONNECTION_TYPE,
         private_key_path: str | None = None,
+        instance_id: str | None = None,
+        aws_profile: str | None = None,
+        aws_region: str | None = None,
         pre_local_commands: list[str] | None = None,
         pre_remote_commands: list[str] | None = None,
         post_remote_commands: list[str] | None = None,
@@ -60,6 +68,12 @@ class ConfigManager:
         uninstall_remote_commands: list[str] | None = None,
     ) -> None:
         """Add or update a server, preserving existing comments and formatting."""
+        if connection_type not in VALID_CONNECTION_TYPES:
+            raise ValueError(
+                f"Invalid connection_type '{connection_type}'. "
+                f"Must be one of: {', '.join(sorted(VALID_CONNECTION_TYPES))}."
+            )
+
         alias = alias.strip()
         self.init_config()
         doc = self._read()
@@ -71,9 +85,16 @@ class ConfigManager:
         entry["port"] = port
         entry["user"] = user
         entry["bench_path"] = bench_path
+        entry["connection_type"] = connection_type
 
-        if private_key_path is not None:
-            entry["private_key_path"] = private_key_path
+        for key, value in (
+            ("private_key_path", private_key_path),
+            ("instance_id", instance_id),
+            ("aws_profile", aws_profile),
+            ("aws_region", aws_region),
+        ):
+            if value is not None:
+                entry[key] = value
 
         for hook, commands in (
             ("pre_local_commands", pre_local_commands),
@@ -97,12 +118,23 @@ class ConfigManager:
         server["private_key_path"] = private_key_path
         TOMLFile(self.config_path).write(doc)
 
+    def clear_private_key(self, alias: str) -> None:
+        """Remove the private key path from a server's configuration, if present."""
+        doc, server = self._get_server_entry(alias)
+        if "private_key_path" in server:
+            del server["private_key_path"]
+            TOMLFile(self.config_path).write(doc)
+
     def get_server(self, alias: str) -> dict | None:
         """Return the configuration for a specific server alias."""
         return self.list_servers().get(alias)
 
     def list_servers(self) -> dict:
-        """Return all configured servers keyed by alias."""
+        """Return all configured servers keyed by alias.
+
+        Older config entries predate the `connection_type` field; they are
+        defaulted to "ssh" here so every caller sees a consistent schema.
+        """
         try:
             doc = self._read()
         except FileNotFoundError:
@@ -111,7 +143,13 @@ class ConfigManager:
         servers = doc.get("servers")
         if servers is None:
             return {}
-        return {str(alias).strip(): dict(config) for alias, config in servers.items()}
+
+        result = {}
+        for alias, config in servers.items():
+            server = dict(config)
+            server.setdefault("connection_type", DEFAULT_CONNECTION_TYPE)
+            result[str(alias).strip()] = server
+        return result
 
     def remove_server(self, alias: str) -> None:
         """Remove a server from the configuration."""
