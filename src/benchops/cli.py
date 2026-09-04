@@ -13,6 +13,7 @@ from benchops.auth import AuthManager, KeyringUnavailableError
 from benchops.config import ConfigManager
 from benchops.deploy import DeployCommand
 from benchops.install import InstallCommand
+from benchops.runner import BenchOpsConnectionError
 from benchops.uninstall import UninstallCommand
 
 
@@ -38,6 +39,8 @@ app = typer.Typer(
 )
 server_app = typer.Typer(help="Manage configured remote servers.")
 app.add_typer(server_app, name="server")
+auth_app = typer.Typer(help="Bootstrap and manage BenchOps SSH trust.")
+app.add_typer(auth_app, name="auth")
 
 console = Console()
 
@@ -222,6 +225,56 @@ def remove_server(
             f"[yellow]Warning: Could not clear the stored credential from the system "
             f"keyring for '{alias}': {exc}[/yellow]"
         )
+
+
+@auth_app.command("setup-keys")
+def setup_keys(
+    alias: str = typer.Argument(..., help="Alias of the configured server to provision."),
+) -> None:
+    """Bootstrap SSH trust for a server: generate (or reuse) the BenchOps
+    keypair and install its public key via an AWS SSM RunCommand.
+
+    This is the one bootstrap step allowed to establish an SSH credential
+    without an already-open port 22 connection — it authenticates entirely
+    through the SSM control plane (IAM), never over SSH itself.
+    """
+    config = ConfigManager()
+    server_config = config.get_server(alias)
+    if server_config is None:
+        console.print(f"[red]Error: No server found with alias '{alias}'.[/red]")
+        raise typer.Exit(1)
+
+    if server_config.get("connection_type") != "ssm":
+        console.print(
+            f"[red]Error: '{alias}' is not configured with connection_type 'ssm'. "
+            "Key provisioning via SSM requires connection_type = 'ssm'.[/red]"
+        )
+        raise typer.Exit(1)
+
+    instance_id = server_config.get("instance_id")
+    if not instance_id:
+        console.print(f"[red]Error: Server '{alias}' has no instance_id configured.[/red]")
+        raise typer.Exit(1)
+
+    auth = AuthManager()
+    private_path, public_path = auth.generate_keypair()
+    console.print(f"[cyan]Using BenchOps keypair: {private_path}[/cyan]")
+
+    console.print(f"[yellow]Installing public key on '{alias}' ({instance_id}) via SSM...[/yellow]")
+    try:
+        auth.provision_public_key(
+            instance_id=instance_id,
+            remote_user=server_config["user"],
+            public_key=public_path.read_text(),
+            aws_profile=server_config.get("aws_profile"),
+            aws_region=server_config.get("aws_region"),
+        )
+    except BenchOpsConnectionError as exc:
+        console.print(f"[red]Error: Failed to provision the SSH key via SSM: {exc}[/red]")
+        raise typer.Exit(1)
+
+    config.update_server_key(alias, str(private_path))
+    console.print(f"[green]SSH trust established for '{alias}'. Private key: {private_path}[/green]")
 
 
 @app.command("deploy")
