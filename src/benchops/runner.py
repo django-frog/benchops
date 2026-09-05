@@ -34,16 +34,47 @@ class BenchOpsConnectionError(Exception):
     process, or a failed SSM tunnel/subprocess."""
 
 
+class BenchOpsCommandError(Exception):
+    """Raised by Runner.capture() when the command itself ran (the transport
+    was fine) but exited non-zero. Carries the captured output so callers
+    can decide how to surface it, rather than only getting a return code.
+    """
+
+    def __init__(self, exit_code: int, stdout: str, stderr: str) -> None:
+        self.exit_code = exit_code
+        self.stdout = stdout
+        self.stderr = stderr
+        super().__init__(f"Command exited with code {exit_code}")
+
+
 class Runner(ABC):
     """Common contract for anything that can execute commands and transfer
     files, whether that's a local subprocess, a direct SSH connection, or a
     connection brokered through an AWS SSM session."""
 
     @abstractmethod
-    def run(self, command: str, cwd: str | None = None) -> None:
+    def run(self, command: str, cwd: str | None = None, interactive: bool = False) -> None:
         """Execute a shell command, streaming output to the console.
 
+        `interactive=True` is for long-running, foreground commands that
+        don't exit on their own (e.g. `tail -f`) and that a local Ctrl+C
+        should be able to stop. For RemoteRunner this allocates a remote
+        pty so Ctrl+C is delivered as a real SIGINT on the far end, and
+        tolerates a non-zero exit (the expected result of being
+        interrupted) instead of raising for it.
+
         Raises BenchOpsConnectionError if the transport itself fails.
+        """
+
+    @abstractmethod
+    def capture(self, command: str, cwd: str | None = None) -> str:
+        """Execute a command and return its captured stdout, without
+        streaming it live — for callers that need to parse or post-process
+        the output rather than mirror it to the terminal.
+
+        Raises BenchOpsConnectionError if the transport itself fails, or
+        BenchOpsCommandError (with stdout/stderr attached) if the command
+        ran but exited non-zero.
         """
 
     @abstractmethod
@@ -71,7 +102,7 @@ class Runner(ABC):
 class LocalRunner(Runner):
     """Runs commands locally, streaming output to the terminal in real-time."""
 
-    def run(self, command: str, cwd: str | None = None) -> None:
+    def run(self, command: str, cwd: str | None = None, interactive: bool = False) -> None:
         """Run a shell command locally, streaming stdout and stderr to the console.
 
         On POSIX the command is shlex-split and run without an intermediate
@@ -83,6 +114,11 @@ class LocalRunner(Runner):
         is handed to cmd.exe via shell=True instead. This is safe here
         because `command` always comes from the operator's own config.toml
         hooks, never from untrusted input.
+
+        `interactive` is accepted for interface parity with RemoteRunner but
+        is a no-op here: a local child process already receives Ctrl+C
+        (SIGINT) directly from the terminal's process group, with no relay
+        needed.
         """
         is_windows = platform.system() == "Windows"
         try:
@@ -103,6 +139,24 @@ class LocalRunner(Runner):
         returncode = proc.wait()
         if returncode != 0:
             raise subprocess.CalledProcessError(returncode, command)
+
+    def capture(self, command: str, cwd: str | None = None) -> str:
+        """Run a shell command locally and return its captured stdout."""
+        is_windows = platform.system() == "Windows"
+        try:
+            result = subprocess.run(
+                command if is_windows else shlex.split(command),
+                shell=is_windows,
+                capture_output=True,
+                text=True,
+                cwd=cwd,
+            )
+        except OSError as exc:
+            raise BenchOpsConnectionError(f"Failed to execute local command '{command}': {exc}") from exc
+
+        if result.returncode != 0:
+            raise BenchOpsCommandError(result.returncode, result.stdout, result.stderr)
+        return result.stdout
 
     def put(self, local_path: str, remote_path: str) -> None:
         """Copy a file locally. Kept for interface parity with RemoteRunner."""
@@ -308,13 +362,37 @@ class RemoteRunner(Runner):
             f"Failed to {action} on {self.user}@{self.display_target}: {exc}.{detail}"
         )
 
-    def run(self, command: str, cwd: str | None = None) -> None:
-        """Run a command on the remote host, streaming output to the terminal."""
+    def run(self, command: str, cwd: str | None = None, interactive: bool = False) -> None:
+        """Run a command on the remote host, streaming output to the terminal.
+
+        With `interactive=True`, a remote pty is allocated. Invoke's runner
+        deliberately does not let a local Ctrl+C stop a plain (non-pty)
+        blocking run() — it just forwards the interrupt byte to the remote
+        process's stdin and keeps waiting, which never actually stops a
+        command like `tail -f` that doesn't read stdin. With a real remote
+        pty, that same forwarded byte is interpreted by the remote tty line
+        discipline as SIGINT, which does stop it — so Ctrl+C works as
+        expected. `warn=True` goes with it: being interrupted is the
+        expected/successful outcome here, not a failure to raise on.
+        """
         full_command = f"cd {shlex.quote(cwd)} && {command}" if cwd else command
         try:
-            self.connection.run(full_command, hide=False)
+            self.connection.run(full_command, hide=False, pty=interactive, warn=interactive)
         except (paramiko.ssh_exception.SSHException, OSError) as exc:
             raise self._connection_error("connect", exc) from exc
+
+    def capture(self, command: str, cwd: str | None = None) -> str:
+        """Run a command on the remote host and return its captured stdout,
+        without echoing it to the local terminal."""
+        full_command = f"cd {shlex.quote(cwd)} && {command}" if cwd else command
+        try:
+            result = self.connection.run(full_command, hide=True, warn=True)
+        except (paramiko.ssh_exception.SSHException, OSError) as exc:
+            raise self._connection_error("connect", exc) from exc
+
+        if result.exited != 0:
+            raise BenchOpsCommandError(result.exited, result.stdout, result.stderr)
+        return result.stdout
 
     def put(self, local_path: str, remote_path: str) -> None:
         """Transfer a local file to the remote host over SFTP."""

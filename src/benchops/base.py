@@ -13,9 +13,9 @@ console = Console()
 class BaseCommand:
     """Base class providing shared logic for CLI commands."""
 
-    def __init__(self, app_name: str, server_alias: str, site: str | None = None) -> None:
-        self.app_name = app_name
+    def __init__(self, server_alias: str, app_name: str | None = None, site: str | None = None) -> None:
         self.server_alias = server_alias
+        self.app_name = app_name
         self.site = site
         self.config = ConfigManager()
         self.auth = AuthManager()
@@ -31,6 +31,11 @@ class BaseCommand:
             cmd = cmd.replace("{site}", self.site)
 
         if "{app}" in cmd:
+            if not self.app_name:
+                console.print(
+                    f"[red]Error: Command '{cmd}' requires an app name, but none was provided.[/red]"
+                )
+                raise typer.Exit(1)
             cmd = cmd.replace("{app}", self.app_name)
 
         return cmd

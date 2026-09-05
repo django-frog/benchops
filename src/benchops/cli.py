@@ -12,7 +12,9 @@ from rich.table import Table
 from benchops.auth import AuthManager, KeyringUnavailableError
 from benchops.config import ConfigManager
 from benchops.deploy import DeployCommand
+from benchops.execute import ExecuteCommand
 from benchops.install import InstallCommand
+from benchops.logs import LogsCommand, LogType
 from benchops.runner import BenchOpsConnectionError
 from benchops.uninstall import UninstallCommand
 
@@ -284,7 +286,7 @@ def deploy(
     site: str | None = typer.Option(None, help="Specific site to target for remote commands (e.g., test-16.akwad.qa)."),
 ) -> None:
     """Deploy a local Frappe app to a remote server."""
-    command = DeployCommand(app_name, server_alias, site)
+    command = DeployCommand(server_alias=server_alias, app_name=app_name, site=site)
     command.execute()
 
 
@@ -373,7 +375,7 @@ def install(
     ),
 ) -> None:
     """Execute one-time installation hooks for a Frappe app on a remote server."""
-    command = InstallCommand(app_name, server_alias, site)
+    command = InstallCommand(server_alias=server_alias, app_name=app_name, site=site)
     command.execute()
 
 @app.command("uninstall")
@@ -387,5 +389,37 @@ def uninstall(
     ),
 ) -> None:
     """Execute one-time uninstallation hooks for a Frappe app on a remote server."""
-    command = UninstallCommand(app_name, server_alias, site)
+    command = UninstallCommand(server_alias=server_alias, app_name=app_name, site=site)
+    command.execute()
+
+
+@app.command("logs")
+def logs(
+    server_alias: str = typer.Argument(..., help="Alias of the target server."),
+    log_type: LogType | None = typer.Option(
+        None,
+        "--type",
+        help="Specific log to tail (frappe.log, web.error.log, or worker.error.log). "
+        "Defaults to tailing all three together.",
+    ),
+) -> None:
+    """Tail bench log files on a remote server in real time. Press Ctrl+C to stop."""
+    command = LogsCommand(server_alias=server_alias, log_type=log_type)
+    command.execute()
+
+
+@app.command("execute")
+def execute(
+    server_alias: str = typer.Argument(..., help="Alias of the target server."),
+    method: str = typer.Argument(..., help="Dotted path of the Python method to run (e.g. frappe.clear_cache)."),
+    site: str = typer.Option(..., "--site", help="Site to execute the method against."),
+    args: str | None = typer.Option(
+        None, "--args", help='JSON array of positional arguments, e.g. \'[1, "two"]\'.'
+    ),
+    kwargs: str | None = typer.Option(
+        None, "--kwargs", help='JSON object of keyword arguments, e.g. \'{"key": "value"}\'.'
+    ),
+) -> None:
+    """Run a single Python method on a remote site via `bench execute` — never an interactive shell."""
+    command = ExecuteCommand(server_alias=server_alias, site=site, method=method, args=args, kwargs=kwargs)
     command.execute()
