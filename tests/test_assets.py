@@ -1,17 +1,12 @@
 """Asset shipping: only this app's manifest entries leave the local bench,
-and the remote merge replaces exactly those entries — other apps' bundles
-and stale entries of this app are handled correctly.
+and only when the bundles they reference exist on disk.
 """
 
 import json
-import os
-import platform
-import sys
 
 import pytest
 
-from benchops.assets import collect_app_manifests, resolve_bench_path, ship_manifests
-from benchops.runner import LocalRunner
+from benchops.assets import collect_app_manifests, resolve_bench_path
 
 
 def _make_bench(root, manifests, built_files=()):
@@ -87,45 +82,3 @@ def test_resolve_bench_path_requires_sites_dir(tmp_path):
 
     (tmp_path / "sites").mkdir()
     assert resolve_bench_path(tmp_path / "apps" / "myapp") == tmp_path.resolve()
-
-
-@pytest.mark.skipif(platform.system() == "Windows", reason="remote bench is always POSIX")
-def test_ship_merges_into_remote_manifest(tmp_path):
-    remote = tmp_path / "remote"
-    _make_bench(
-        remote,
-        {
-            "assets.json": {
-                "myapp.bundle.js": "/assets/myapp/dist/js/myapp.bundle.OLD.js",
-                "myapp.removed.bundle.js": "/assets/myapp/dist/js/myapp.removed.bundle.OLD.js",
-                "desk.bundle.js": "/assets/frappe/dist/js/desk.bundle.AAA.js",
-            },
-        },
-    )
-    (remote / "sites" / "common_site_config.json").write_text(json.dumps({}))
-    (remote / "env" / "bin").mkdir(parents=True)
-    os.symlink(sys.executable, remote / "env" / "bin" / "python")
-    local_tmp = tmp_path / "local"
-    local_tmp.mkdir()
-
-    ship_manifests(
-        LocalRunner(),
-        {
-            "assets.json": {"myapp.bundle.js": "/assets/myapp/dist/js/myapp.bundle.NEW.js"},
-            "assets-rtl.json": {"rtl_myapp.bundle.css": "/assets/myapp/dist/css-rtl/myapp.bundle.NEW.css"},
-        },
-        "myapp",
-        str(local_tmp),
-        str(remote),
-    )
-
-    assets_dir = remote / "sites" / "assets"
-    assert json.loads((assets_dir / "assets.json").read_text()) == {
-        "desk.bundle.js": "/assets/frappe/dist/js/desk.bundle.AAA.js",
-        "myapp.bundle.js": "/assets/myapp/dist/js/myapp.bundle.NEW.js",
-    }
-    assert json.loads((assets_dir / "assets-rtl.json").read_text()) == {
-        "rtl_myapp.bundle.css": "/assets/myapp/dist/css-rtl/myapp.bundle.NEW.css",
-    }
-    assert not list((remote / "sites").glob(".benchops-*"))
-    assert not list(assets_dir.glob("*.benchops.tmp"))

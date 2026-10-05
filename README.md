@@ -1,10 +1,11 @@
 # BenchOps
 
-A robust Command Line Interface (CLI) tool designed to streamline and synchronize local Frappe development environments with remote servers. BenchOps automates the deployment pipeline, offering extensible lifecycle command hooks, automated archiving, SFTP transfers, and dynamic multi-site target resolution.
+A robust Command Line Interface (CLI) tool designed to streamline and synchronize local Frappe development environments with remote servers. BenchOps automates the deployment pipeline, offering git-verified code syncing, extensible lifecycle command hooks, and dynamic multi-site target resolution.
 
 ## Features
 
-* **Automated Code Syncing:** Compresses your local Frappe app into a tarball, transfers it securely via SFTP, and extracts it directly into the remote bench, replacing manual SSH copying.
+* **Git-Verified Code Syncing:** Each deploy ships your working tree as a git snapshot commit (committed and uncommitted changes, never ignored files) and makes the server's app match it exactly — files you deleted are removed, staging edits to deployed files are overwritten (with a backup), and files created on staging (e.g. in Desk) are kept out of git and left alone. The server's tree hash is verified against yours after every deploy.
+* **Conflict-Safe on Shared Servers:** A per-app deploy lock, plus checks that stop a deploy when the server runs commits missing from your history or its code was changed outside BenchOps.
 * **Build Locally, Ship Assets:** Every deploy carries the app's locally built bundles *and* its entries from the bench's `assets.json`/`assets-rtl.json` manifests, merging them into the remote bench and invalidating Frappe's cached manifest — so the remote never needs to run `bench build`.
 * **Extensible Lifecycle Hooks:** Define custom shell commands to execute at specific stages of the deployment pipeline (`pre-local`, `pre-remote`, `post-remote`, `install-remote`, `uninstall-remote`).
 * **Embedded Multiline Editor:** Write and manage your deployment scripts directly in the terminal using a built-in interactive editor (powered by `prompt_toolkit`).
@@ -143,15 +144,29 @@ benchops deploy custom_app staging --site test-16.akwad.qa
 
 ```
 
-Run it from your local bench root. Assets are always built locally and shipped — never built on the remote:
+Run it from your local bench root. The app must be the root of its own git repository (as every `bench new-app`/`bench get-app` app is), and the server needs `git`.
+
+**First deploy to a server: `--adopt`.** Servers deployed by older BenchOps versions (or set up by hand) have no deploy record yet. The first deploy must be run with `--adopt`: BenchOps lists every file on the server that isn't in your snapshot and lets you keep it (it becomes a staging-only file) or delete it (a leftover from the old archive-based deploys):
+
+```bash
+benchops deploy custom_app staging --site test-16.akwad.qa --adopt
+```
+
+**What a deploy does:**
 
 1. `pre-local` hooks run — this is where `bench build --app {app}` belongs.
-2. BenchOps reads this app's entries from the local `sites/assets/assets.json` and `assets-rtl.json`, failing the deploy if the bench has never been built or the manifest references a bundle missing from `dist/`.
-3. The app (including `public/dist/`) is archived, transferred, and extracted into the remote `apps/` directory.
-4. The app's manifest entries are merged into the remote manifests — other apps' entries are left untouched, and this app's stale entries are replaced — and the `assets_json` key is cleared from `redis_cache`, exactly as `bench build` does.
-5. `post-remote` hooks run (e.g., `bench --site {site} migrate` and `bench restart`).
+2. Your working tree is committed as a *snapshot* on top of HEAD using a throwaway index — your branch, staging area, and stash are never touched. Ignored files, `__pycache__`, `node_modules`, and `public/dist` are never part of it.
+3. On the server, BenchOps takes the app's deploy lock and checks the current state. It stops if the server runs commits that aren't in your history (pull or rebase first), or if the app's HEAD was moved outside BenchOps.
+4. One package is uploaded: a git bundle with only the commits the server is missing, the built `public/dist/` (when it changed), and this app's entries from the local `sites/assets/assets*.json`.
+5. A **deploy plan** is shown — base branch and commit, uncommitted files being shipped, files removed from the server, staging edits that will be overwritten, staging-only files kept, suggested follow-up steps (`migrate`, `restart`, `setup requirements`), and warnings (branch switch, unpushed commits, Frappe version mismatch). Confirm it, or pass `--yes`.
+6. `pre-remote` hooks run, then the snapshot is checked out on the server. Staging edits to deployed files are first saved under `refs/benchops/overwritten/<timestamp>`; staging-only files are listed in the BenchOps block of `.git/info/exclude`, so they stay out of git and survive every deploy. `public/dist/` is replaced, the manifests are merged (other apps' entries untouched), and `assets_json` is cleared from `redis_cache`.
+7. The server's tree hash is verified against your snapshot, the deploy record is written to `apps/<app>/.git/benchops/`, and `post-remote` hooks run (e.g. `bench --site {site} migrate` and `bench restart`). The lock is always released.
 
-If the local manifest has no entries for the app (a backend-only app), step 4 is skipped and the remote manifest is left as-is.
+If nothing changed since the last deploy, BenchOps says so and exits without touching the server. If a file changes on the server while the plan is on screen (e.g. a Desk save), nothing is applied and you re-run the deploy.
+
+**Options:** `--adopt` (first deploy), `--yes`/`-y` (skip confirmation), `--force` (deploy over commits missing from your history, or a moved HEAD), `--break-lock` (take over a stale lock).
+
+> Desk changes that only live in the database (Custom Fields, Property Setters, Client Scripts) are not files and are not synced. Export them as fixtures (`bench --site {site} export-fixtures --app {app}`, e.g. as a `pre-local` hook) so they become part of the snapshot.
 
 ### Installing an Application (One-Time)
 

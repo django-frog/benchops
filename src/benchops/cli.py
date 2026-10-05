@@ -284,9 +284,25 @@ def deploy(
     app_name: str = typer.Argument(..., help="Name of the local Frappe app directory to sync."),
     server_alias: str = typer.Argument(..., help="Alias of the target server."),
     site: str | None = typer.Option(None, help="Specific site to target for remote commands (e.g., test-16.akwad.qa)."),
+    adopt: bool = typer.Option(
+        False, "--adopt", help="First git-based deploy: take over the app on the server and review its existing files."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Apply the deploy plan without asking for confirmation."),
+    force: bool = typer.Option(
+        False, "--force", help="Deploy even if the server runs commits missing from your history, or its HEAD moved."
+    ),
+    break_lock: bool = typer.Option(False, "--break-lock", help="Take over a stale deploy lock left on the server."),
 ) -> None:
-    """Deploy a local Frappe app to a remote server."""
-    command = DeployCommand(server_alias=server_alias, app_name=app_name, site=site)
+    """Deploy a local Frappe app to a remote server as a verified git snapshot."""
+    command = DeployCommand(
+        server_alias=server_alias,
+        app_name=app_name,
+        site=site,
+        adopt=adopt,
+        yes=yes,
+        force=force,
+        break_lock=break_lock,
+    )
     command.execute()
 
 
