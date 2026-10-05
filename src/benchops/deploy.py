@@ -10,6 +10,7 @@ import typer
 from invoke.exceptions import UnexpectedExit
 from rich.console import Console
 
+from benchops.assets import collect_app_manifests, resolve_bench_path, ship_manifests
 from benchops.base import BaseCommand
 from benchops.runner import BenchOpsConnectionError, LocalRunner
 from benchops.sync import create_tarball, extract_and_cleanup, transfer_tarball
@@ -44,6 +45,9 @@ class DeployCommand(BaseCommand):
                     console.print(f"[cyan]Executing: {cmd}[/cyan]")
                     local_runner.run(cmd, cwd=str(app_dir.parent))
 
+                manifests = collect_app_manifests(resolve_bench_path(app_dir), self.app_name)
+                asset_count = sum(len(entries) for entries in manifests.values())
+
                 with tempfile.TemporaryDirectory() as tmp_dir:
                     tarball = create_tarball(str(app_dir), os.path.join(tmp_dir, f"{self.app_name}.tar.gz"))
                     console.print(f"[green]Created tarball: {tarball}[/green]")
@@ -64,6 +68,17 @@ class DeployCommand(BaseCommand):
 
                     extract_and_cleanup(remote_runner, remote_tar_path, remote_dest_dir)
                     console.print("[green]Extracted on remote server.[/green]")
+
+                    if asset_count:
+                        ship_manifests(
+                            remote_runner, manifests, self.app_name, tmp_dir, server_config["bench_path"]
+                        )
+                        console.print(f"[green]Shipped {asset_count} built asset entries.[/green]")
+                    else:
+                        console.print(
+                            f"[yellow]No built assets found for '{self.app_name}' in the local manifest; "
+                            "leaving the remote manifest untouched.[/yellow]"
+                        )
 
                 console.print("[yellow]Starting remote post-deploy commands...[/yellow]")
                 post_remote_commands = server_config.get("post_remote_commands", [])

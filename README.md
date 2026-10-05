@@ -5,6 +5,7 @@ A robust Command Line Interface (CLI) tool designed to streamline and synchroniz
 ## Features
 
 * **Automated Code Syncing:** Compresses your local Frappe app into a tarball, transfers it securely via SFTP, and extracts it directly into the remote bench, replacing manual SSH copying.
+* **Build Locally, Ship Assets:** Every deploy carries the app's locally built bundles *and* its entries from the bench's `assets.json`/`assets-rtl.json` manifests, merging them into the remote bench and invalidating Frappe's cached manifest — so the remote never needs to run `bench build`.
 * **Extensible Lifecycle Hooks:** Define custom shell commands to execute at specific stages of the deployment pipeline (`pre-local`, `pre-remote`, `post-remote`, `install-remote`, `uninstall-remote`).
 * **Embedded Multiline Editor:** Write and manage your deployment scripts directly in the terminal using a built-in interactive editor (powered by `prompt_toolkit`).
 * **Dynamic Target Resolution:** Use the `{site}` and `{app}` placeholders in your hook configurations to dynamically target specific Frappe tenant environments and applications during execution.
@@ -113,7 +114,7 @@ You can write generic hooks that apply to any deployment by using these placehol
 
 **Available Lifecycle Phases:**
 
-* `pre-local`: Runs on your local machine before archiving (e.g., compiling assets).
+* `pre-local`: Runs on your local machine before archiving (e.g., `bench build --app {app}`).
 * `pre-remote`: Runs on the remote server before the new code is extracted (e.g., enabling maintenance mode).
 * `post-remote`: Runs on the remote server after extraction (e.g., database migrations, clearing cache).
 * `install-remote`: Runs exactly once when using the `install` command (e.g., `bench --site {site} install-app {app}`).
@@ -141,6 +142,16 @@ Synchronize your local code and run the deployment hooks (`pre-local`, `pre-remo
 benchops deploy custom_app staging --site test-16.akwad.qa
 
 ```
+
+Run it from your local bench root. Assets are always built locally and shipped — never built on the remote:
+
+1. `pre-local` hooks run — this is where `bench build --app {app}` belongs.
+2. BenchOps reads this app's entries from the local `sites/assets/assets.json` and `assets-rtl.json`, failing the deploy if the bench has never been built or the manifest references a bundle missing from `dist/`.
+3. The app (including `public/dist/`) is archived, transferred, and extracted into the remote `apps/` directory.
+4. The app's manifest entries are merged into the remote manifests — other apps' entries are left untouched, and this app's stale entries are replaced — and the `assets_json` key is cleared from `redis_cache`, exactly as `bench build` does.
+5. `post-remote` hooks run (e.g., `bench --site {site} migrate` and `bench restart`).
+
+If the local manifest has no entries for the app (a backend-only app), step 4 is skipped and the remote manifest is left as-is.
 
 ### Installing an Application (One-Time)
 
