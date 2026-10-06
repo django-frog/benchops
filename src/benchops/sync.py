@@ -3,7 +3,7 @@
 A deploy package is a single .tar.gz uploaded per deploy:
 
     meta.json          what the package carries (bundle ref, build outputs)
-    snapshot.bundle    git objects the remote is missing (optional)
+    staged.bundle      the staged commit and the commits the remote is missing
     build/<path>       each shipped build output, by path in the app
     manifests.json     the app's entries from sites/assets/assets*.json
 """
@@ -85,7 +85,7 @@ def build_package(
         tar.add(staging / "meta.json", arcname="meta.json", filter=_neutral_owner)
         tar.add(staging / "manifests.json", arcname="manifests.json", filter=_neutral_owner)
         if bundle_path is not None:
-            tar.add(bundle_path, arcname="snapshot.bundle", filter=_neutral_owner)
+            tar.add(bundle_path, arcname="staged.bundle", filter=_neutral_owner)
         for rel in meta["build_outputs"]:
             tar.add(app_dir / rel, arcname=f"build/{rel}", filter=_neutral_owner)
     return output_path

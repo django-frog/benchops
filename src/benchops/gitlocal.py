@@ -1,17 +1,16 @@
 """Local git operations for the deploy pipeline.
 
-A deploy ships a *snapshot commit*: the developer's working tree (tracked
-and untracked files, minus anything ignored) committed on top of HEAD
-without touching their branch, index, or stash. The snapshot's tree hash is
-the content identity of what gets deployed; its parent is the developer's
-real HEAD, which is what branch and ancestry checks are based on.
+A deploy ships the developer's commits plus what they staged with
+`git add`. Both travel as one *staged commit*: its tree is their index and
+its parent is their HEAD. It is built with plumbing commands only, so their
+branch, index, working tree and stash are never touched; unstaged edits and
+untracked files stay on their machine.
 """
 
 import getpass
 import os
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,12 +20,14 @@ class GitError(Exception):
 
 
 @dataclass
-class Snapshot:
+class StagedState:
     commit: str
     tree: str
     base: str
-    branch: str
-    uncommitted: list[tuple[str, str]] = field(default_factory=list)
+    branch: str | None
+    staged: list[tuple[str, str]] = field(default_factory=list)
+    unstaged: list[tuple[str, str]] = field(default_factory=list)
+    untracked: list[str] = field(default_factory=list)
 
 
 class LocalRepo:
@@ -91,11 +92,11 @@ class LocalRepo:
         except GitError:
             return getpass.getuser()
 
-    def branch(self) -> str:
+    def branch(self) -> str | None:
         try:
             return self._git("symbolic-ref", "--short", "-q", "HEAD").strip()
         except GitError:
-            return "(detached)"
+            return None
 
     def _identity_env(self, env: dict) -> dict:
         """commit-tree needs an identity; fall back to the OS user if git has none."""
@@ -106,52 +107,42 @@ class LocalRepo:
                 env.setdefault(f"GIT_{role}_EMAIL", f"{user}@localhost")
         return env
 
-    def snapshot(self, app_name: str, deployer: str, build_outputs: list[str] = ()) -> Snapshot:
-        """Commit the current working tree on top of HEAD using a throwaway index.
+    def staged_state(self, deployer: str, build_outputs: list[str] = ()) -> StagedState:
+        """Capture HEAD plus the index as a staged commit, and list what is
+        staged, unstaged and untracked. Build outputs are left out of the
+        lists: they ship from the build, not from git."""
+        if self._git("ls-files", "--unmerged").strip():
+            raise GitError("The index has unresolved merge conflicts; resolve them before deploying.")
 
-        Build outputs are dropped from the snapshot even if they are tracked
-        (e.g. an SPA build committed before it was gitignored); they ship
-        separately, straight from the build."""
+        def keep(path: str) -> bool:
+            return not any(path == out or path.startswith(out + "/") for out in build_outputs)
+
         base = self._git("rev-parse", "HEAD").strip()
         branch = self.branch()
-        index = Path(self._git("rev-parse", "--git-path", "index").strip())
-        if not index.is_absolute():
-            index = self.path / index
-
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_index = Path(tmp) / "index"
-            if index.exists():
-                shutil.copy2(index, tmp_index)
-            env = self._identity_env(dict(os.environ, GIT_INDEX_FILE=str(tmp_index)))
-            self._git("add", "-A", env=env)
-            # Build output and caches never belong in the snapshot, even when
-            # the app's .gitignore forgets them.
-            self._git(
-                "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--",
-                ":(glob)**/__pycache__/**",
-                ":(glob)**/*.pyc",
-                ":(glob)**/node_modules/**",
-                f":(glob){app_name}/public/dist/**",
-                *[f":(literal){path}" for path in build_outputs],
-                env=env,
-            )
-            tree = self._git("write-tree", env=env).strip()
-
-        uncommitted = [
-            (status, path) for status, path in self._name_status(base, tree)
-            if not any(path == out or path.startswith(out + "/") for out in build_outputs)
+        tree = self._git("write-tree").strip()
+        staged = [(s, p) for s, p in self._name_status(base, tree) if keep(p)]
+        unstaged = [(s, p) for s, p in self._name_status() if keep(p)]
+        untracked = [
+            p for p in self._git("ls-files", "--others", "--exclude-standard", "-z").split("\0") if p and keep(p)
         ]
-        message = f"benchops snapshot: {branch}@{base[:10]}"
-        if uncommitted:
-            message += f" + {len(uncommitted)} uncommitted file(s)"
+
+        message = f"benchops staged changes: {branch or '(detached)'}@{base[:10]}, {len(staged)} staged file(s)"
         message += f"\n\nDeployed by {deployer}."
         commit = self._git(
             "commit-tree", tree, "-p", base, "-m", message, env=self._identity_env(dict(os.environ))
         ).strip()
-        return Snapshot(commit=commit, tree=tree, base=base, branch=branch, uncommitted=uncommitted)
+        return StagedState(
+            commit=commit, tree=tree, base=base, branch=branch, staged=staged, unstaged=unstaged, untracked=untracked
+        )
 
-    def _name_status(self, old: str, new: str) -> list[tuple[str, str]]:
-        parts = [p for p in self._git("diff", "--name-status", "-z", "--no-renames", old, new).split("\0") if p]
+    def commits_between(self, old: str, new: str) -> int | None:
+        """How many commits `new` is ahead of `old`, if `old` is known here."""
+        if not self.has_commit(old):
+            return None
+        return int(self._git("rev-list", "--count", f"{old}..{new}").strip())
+
+    def _name_status(self, *revs: str) -> list[tuple[str, str]]:
+        parts = [p for p in self._git("diff", "--name-status", "-z", "--no-renames", *revs).split("\0") if p]
         return list(zip(parts[0::2], parts[1::2]))
 
     def update_ref(self, ref: str, commit: str) -> None:

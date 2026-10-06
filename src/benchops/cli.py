@@ -16,6 +16,7 @@ from benchops.execute import ExecuteCommand
 from benchops.install import InstallCommand
 from benchops.logs import LogsCommand, LogType
 from benchops.runner import BenchOpsConnectionError
+from benchops.status import StatusCommand
 from benchops.uninstall import UninstallCommand
 
 
@@ -284,30 +285,40 @@ def deploy(
     app_name: str = typer.Argument(..., help="Name of the local Frappe app directory to sync."),
     server_alias: str = typer.Argument(..., help="Alias of the target server."),
     site: str | None = typer.Option(None, help="Specific site to target for remote commands (e.g., test-16.akwad.qa)."),
-    adopt: bool = typer.Option(
-        False, "--adopt", help="First git-based deploy: take over the app on the server and review its existing files."
-    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Apply the deploy plan without asking for confirmation."),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Allow replacing files that have different uncommitted changes on the server."
+    ),
     force: bool = typer.Option(
-        False, "--force", help="Deploy even if the server runs commits missing from your history, or its HEAD moved."
+        False, "--force", help="Deploy even if the server is on a commit that is not in your history."
     ),
     break_lock: bool = typer.Option(False, "--break-lock", help="Take over a stale deploy lock left on the server."),
     skip_build: bool = typer.Option(
         False, "--skip-build", help="Don't run 'yarn install' and 'bench build' locally; ship the existing build."
     ),
 ) -> None:
-    """Deploy a local Frappe app to a remote server as a verified git snapshot."""
+    """Deploy your commits and staged changes (git add) to a remote server."""
     command = DeployCommand(
         server_alias=server_alias,
         app_name=app_name,
         site=site,
-        adopt=adopt,
         yes=yes,
+        overwrite=overwrite,
         force=force,
         break_lock=break_lock,
         skip_build=skip_build,
     )
     command.execute()
+
+
+@app.command("status")
+def status(
+    app_name: str = typer.Argument(..., help="Name of the Frappe app."),
+    server_alias: str = typer.Argument(..., help="Alias of the target server."),
+    files: bool = typer.Option(False, "--files", help="List every changed file instead of counts."),
+) -> None:
+    """Show what a server runs for an app: who deployed what, and what changed there since."""
+    StatusCommand(server_alias=server_alias, app_name=app_name, files=files).execute()
 
 
 @server_app.command("add-hook")

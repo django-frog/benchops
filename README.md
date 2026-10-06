@@ -4,8 +4,8 @@ A robust Command Line Interface (CLI) tool designed to streamline and synchroniz
 
 ## Features
 
-* **Git-Verified Code Syncing:** Each deploy ships your working tree as a git snapshot commit (committed and uncommitted changes, never ignored files) and makes the server's app match it exactly — files you deleted are removed, staging edits to deployed files are overwritten (with a backup), and files created on staging (e.g. in Desk) are kept out of git and left alone. The server's tree hash is verified against yours after every deploy.
-* **Conflict-Safe on Shared Servers:** A per-app deploy lock, plus checks that stop a deploy when the server runs commits missing from your history or its code was changed outside BenchOps.
+* **Ship What You Staged:** A deploy ships your commits plus exactly what you staged with `git add` — nothing else. On the server only those files are written; work people do directly on the server is left on disk and stays visible in its `git status`, where your deploy shows as "Changes to be committed". Files changed on both sides are reported up front and are only overwritten after an explicit yes (default: no), with a backup.
+* **Conflict-Safe on Shared Servers:** A per-app deploy lock, a history check that stops a deploy when the server is on a commit you don't have, and `benchops status` to see who deployed what — without logging in.
 * **Build Locally, Ship Assets:** Every deploy carries the app's locally built bundles *and* its entries from the bench's `assets.json`/`assets-rtl.json` manifests, merging them into the remote bench and invalidating Frappe's cached manifest — so the remote never needs to run `bench build`.
 * **Extensible Lifecycle Hooks:** Define custom shell commands to execute at specific stages of the deployment pipeline (`pre-local`, `pre-remote`, `post-remote`, `install-remote`, `uninstall-remote`).
 * **Embedded Multiline Editor:** Write and manage your deployment scripts directly in the terminal using a built-in interactive editor (powered by `prompt_toolkit`).
@@ -115,7 +115,7 @@ You can write generic hooks that apply to any deployment by using these placehol
 
 **Available Lifecycle Phases:**
 
-* `pre-local`: Runs on your local machine before the build and snapshot (e.g., `bench --site {site} export-fixtures --app {app}`). Don't add `bench build` here — every deploy builds the app itself.
+* `pre-local`: Runs on your local machine before the build (e.g., `bench --site {site} export-fixtures --app {app}`). Don't add `bench build` here — every deploy builds the app itself.
 * `pre-remote`: Runs on the remote server before the new code is extracted (e.g., enabling maintenance mode).
 * `post-remote`: Runs on the remote server after extraction (e.g., database migrations, clearing cache).
 * `install-remote`: Runs exactly once when using the `install` command (e.g., `bench --site {site} install-app {app}`).
@@ -144,28 +144,42 @@ benchops deploy custom_app staging --site test-16.akwad.qa
 
 ```
 
-Run it from your local bench root. The app must be the root of its own git repository (as every `bench new-app`/`bench get-app` app is), and the server needs `git`.
+Run it from your local bench root. The app must be the root of its own git repository, and on the server `apps/<app>` must be a git checkout of it (as `bench get-app` creates) with `git` installed.
 
-**First deploy to a server: `--adopt`.** Servers deployed by older BenchOps versions (or set up by hand) have no deploy record yet. The first deploy must be run with `--adopt`: BenchOps lists every file on the server that isn't in your snapshot and lets you keep it (it becomes a staging-only file) or delete it (a leftover from the old archive-based deploys):
-
-```bash
-benchops deploy custom_app staging --site test-16.akwad.qa --adopt
-```
+**What ships:** your commits, plus what you staged with `git add` — your *index*. Unstaged edits and untracked files stay on your machine; the plan lists them under "Not shipped". Stage exactly what you want on the server (`git add -p` stages single hunks).
 
 **What a deploy does:**
 
 1. `pre-local` hooks run.
-2. The app is built locally: `yarn install` in the app (when it has a `package.json`), then `bench build --app <app>`. `bench build` also runs the app's own `build` script, which is how frappe-ui/Vite SPA frontends are built. BenchOps then checks that every build output exists and that built HTML only references `/assets/<app>/…` files that exist, so a stale or partial build fails here instead of as a blank page.
-3. Your working tree is committed as a *snapshot* on top of HEAD using a throwaway index — your branch, staging area, and stash are never touched. Ignored files, `__pycache__`, `node_modules`, and build outputs are never part of it.
-4. On the server, BenchOps takes the app's deploy lock and checks the current state. It stops if the server runs commits that aren't in your history (pull or rebase first), or if the app's HEAD was moved outside BenchOps.
-5. One package is uploaded: a git bundle with only the commits the server is missing, the build outputs (when any of them changed), and this app's entries from the local `sites/assets/assets*.json`.
-6. A **deploy plan** is shown — base branch and commit, uncommitted files being shipped, files removed from the server, staging edits that will be overwritten, staging-only files kept, suggested follow-up steps (`migrate`, `restart`, `setup requirements`), and warnings (branch switch, unpushed commits, Frappe version mismatch). Confirm it, or pass `--yes`.
-7. `pre-remote` hooks run, then the snapshot is checked out on the server. Staging edits to deployed files are first saved under `refs/benchops/overwritten/<timestamp>`; staging-only files are listed in the BenchOps block of `.git/info/exclude`, so they stay out of git and survive every deploy. Each shipped build output replaces the server's copy wholesale (no stale hashed files survive), the manifests are merged (other apps' entries untouched), and `assets_json` is cleared from `redis_cache`.
-8. The server's tree hash is verified against your snapshot, the deploy record is written to `apps/<app>/.git/benchops/`, `bench --site all clear-cache` runs if build outputs were shipped, and `post-remote` hooks run (e.g. `bench --site {site} migrate` and `bench restart`). The lock is always released.
+2. The app is built locally: `yarn install` in the app (when it has a `package.json`), then `bench build --app <app>`, which also runs the app's own `build` script (how frappe-ui/Vite SPA frontends are built). If frontend files have changes that are *not staged*, BenchOps warns you — the build compiles what is on disk, so it would include source that isn't deployed — and asks whether to build anyway (default yes). Answer no to keep the server's current build. BenchOps then checks every build output exists and built HTML only references `/assets/<app>/…` files that exist.
+3. Your commits and index are captured as a *staged commit* (tree = your index, parent = your HEAD) with git plumbing only — your branch, index, working tree and stash are never touched.
+4. On the server BenchOps takes the app's deploy lock and checks the server's commit is in your history. A commit made on the server, or commits you haven't pulled, stop the deploy (`--force` overrides and backs the old HEAD up). A server that just ran `git pull` to a commit you also have is fine.
+5. One package is uploaded: a git bundle with your staged commit and the commits the server is missing, the build outputs (when they changed), and this app's entries from the local `sites/assets/assets*.json`.
+6. A **deploy plan** is shown: your branch and the server's, how many commits and staged files ship, what is not shipped, the files that will be written, and — in red — every **overlap**: a file you're deploying that has *different* uncommitted changes on the server. Overlaps need an explicit yes to "Overwrite these files on staging with your version?" (default **no**); with `--yes` they stop the deploy unless you also pass `--overwrite`. A file the server already has with exactly your content is not an overlap.
+7. `pre-remote` hooks run, then only the files in your deploy are written (or deleted), the server's HEAD moves to your commit on your branch, and your staged files are staged there. Overlapping files are first backed up under `refs/benchops/overwritten/<timestamp>`. Everything else on the server — other people's edits, new files, the previous deploy's changes — stays on disk. Build outputs replace the server's copy wholesale, the asset manifests are merged, and `assets_json` is cleared from `redis_cache`.
+8. The result is verified (HEAD is your commit; every deployed file matches your staged version on disk and in the index), the deploy record is written to `apps/<app>/.git/benchops/`, `bench --site all clear-cache` runs if build outputs were shipped, and `post-remote` hooks run (e.g. `bench --site {site} migrate` and `bench restart`). The lock is always released.
 
-If nothing changed since the last deploy, BenchOps says so and exits without touching the server. If a file changes on the server while the plan is on screen (e.g. a Desk save), nothing is applied and you re-run the deploy.
+**Afterwards, `git status` on the server** reads naturally:
 
-**Options:** `--adopt` (first deploy), `--yes`/`-y` (skip confirmation), `--force` (deploy over commits missing from your history, or a moved HEAD), `--break-lock` (take over a stale lock), `--skip-build` (ship the existing build without rebuilding).
+```
+On branch develop
+Changes to be committed:        ← the last deploy (what its author had staged)
+Changes not staged for commit:  ← edits made on the server, and earlier deploys' changes
+Untracked files:                ← files created on the server
+```
+
+When a later deploy doesn't include files an earlier one staged, those files stay on disk and move to "Changes not staged", so "Changes to be committed" always shows exactly the latest deploy. If nothing would change, BenchOps says so and exits. If a file the deploy writes changes on the server while the plan is on screen (e.g. a Desk save), nothing is applied and you re-run. Servers deployed by 0.12/0.13 (HEAD on a "benchops snapshot" commit) are converted automatically on the next deploy: HEAD goes back to the real commit and those deploys' files show up in `git status`.
+
+**Options:** `--yes`/`-y` (skip confirmation), `--overwrite` (allow overlaps with `--yes`), `--force` (deploy over a server commit that isn't in your history), `--break-lock` (take over a stale lock), `--skip-build` (ship the existing build without rebuilding).
+
+**Who deployed what — `benchops status`:**
+
+```bash
+benchops status basma dev-bench-02          # counts
+benchops status basma dev-bench-02 --files  # every file
+```
+
+It shows the server's branch and commit, the last deploy (who, when, which branch, how many staged files), the server's staged / unstaged / untracked changes, and deployed files someone changed on the server since. It's read-only and doesn't take the lock.
 
 **Build outputs and SPA frontends.** Build outputs are paths a build regenerates. They are shipped straight from the build and never through git, even if an old build was committed. `<app>/public/dist` is always one. For a frappe-ui/Vite frontend, the `outDir` and `indexHtmlPath` in its `vite.config.*` (at the app root or one level below, e.g. `frontend/`) are detected automatically. To declare them explicitly, or to turn detection off with an empty list, use the app's `pyproject.toml`:
 
@@ -176,7 +190,7 @@ build_outputs = ["basma/public/calendar", "basma/www/calendar.html"]
 
 If a build output is tracked in git, the plan warns you. Untrack it (`git rm -r --cached <path>`) and gitignore it, so a rebuild never shows up as a code change.
 
-> Desk changes that only live in the database (Custom Fields, Property Setters, Client Scripts) are not files and are not synced. Export them as fixtures (`bench --site {site} export-fixtures --app {app}`, e.g. as a `pre-local` hook) so they become part of the snapshot.
+> Desk changes that only live in the database (Custom Fields, Property Setters, Client Scripts) are not files and are not synced. Export them as fixtures (`bench --site {site} export-fixtures --app {app}`, e.g. as a `pre-local` hook), then stage the exported files so they ship.
 
 ### Installing an Application (One-Time)
 

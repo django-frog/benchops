@@ -39,14 +39,27 @@ def _relative_to_app(app_dir: Path, path: Path, source: str) -> str:
     return rel.as_posix()
 
 
+def _vite_configs(app_dir: Path) -> list[Path]:
+    configs = [app_dir / name for name in VITE_CONFIG_NAMES]
+    configs += [child / name for child in sorted(app_dir.iterdir()) if child.is_dir() for name in VITE_CONFIG_NAMES]
+    return [config for config in configs if config.is_file()]
+
+
+def frontend_source_dirs(app_dir: Path, app_name: str) -> list[str]:
+    """Directories whose files `bench build` compiles: the app's public/
+    (esbuild bundles) and every Vite project (SPA frontends)."""
+    dirs = [f"{app_name}/public"]
+    for config in _vite_configs(app_dir):
+        rel = config.parent.resolve().relative_to(app_dir.resolve()).as_posix()
+        if rel != "." and rel not in dirs:
+            dirs.append(rel)
+    return dirs
+
+
 def detect_vite_outputs(app_dir: Path) -> list[str]:
     """Find `outDir`/`indexHtmlPath` in Vite configs at the app root or one level below."""
     outputs: list[str] = []
-    configs = [app_dir / name for name in VITE_CONFIG_NAMES]
-    configs += [child / name for child in sorted(app_dir.iterdir()) if child.is_dir() for name in VITE_CONFIG_NAMES]
-    for config in configs:
-        if not config.is_file():
-            continue
+    for config in _vite_configs(app_dir):
         for _, value in _VITE_PATH_RE.findall(config.read_text()):
             rel = _relative_to_app(app_dir, config.parent / value, config.name)
             if rel not in outputs:

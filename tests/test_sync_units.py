@@ -60,49 +60,53 @@ def test_safe_join_rejects_symlinks_escaping_the_app(tmp_path):
         remote_agent.safe_join(str(app), "escape/secret")
 
 
-def test_tracked_changes_parses_renames_and_skips_untracked(tmp_path):
+def test_dirty_paths_lists_every_uncommitted_change(tmp_path):
     repo = init_repo(tmp_path / "repo")
     (repo / "b.txt").write_text("b")
     git(repo, "add", "b.txt")
     git(repo, "commit", "-q", "-m", "b")
     git(repo, "mv", "a.txt", "renamed with space.txt")
     (repo / "b.txt").write_text("changed")
-    (repo / "untracked.txt").write_text("u")
+    (repo / "dir").mkdir()
+    (repo / "dir" / "untracked.txt").write_text("u")
 
-    assert sorted(remote_agent.tracked_changes(str(repo))) == [["M", "b.txt"], ["R", "renamed with space.txt"]]
+    dirty = remote_agent.dirty_paths(str(repo))
+
+    assert dirty == {
+        "a.txt": "D ",
+        "renamed with space.txt": "A ",
+        "b.txt": " M",
+        "dir/untracked.txt": "??",
+    }
+    assert [remote_agent.describe(dirty[p]) for p in ("a.txt", "b.txt", "dir/untracked.txt")] == [
+        "deleted on staging",
+        "modified on staging",
+        "new file on staging",
+    ]
 
 
-def test_staging_owned_round_trip_escapes_special_characters(tmp_path):
+def test_ignore_block_hides_caches_and_build_outputs_and_drops_old_staging_only_entries(tmp_path):
     repo = init_repo(tmp_path / "repo", commit=False)
     exclude = repo / ".git" / "info" / "exclude"
-    exclude.write_text("# user rule\n*.log\n")
-    owned = ["myapp/report/a b/[x].json", "myapp/#hash.json", "myapp/!bang.json"]
+    exclude.write_text(
+        "# user rule\n*.log\n"
+        + "\n".join([remote_agent.IGNORE_BEGIN, "/myapp/public/dist/", "# staging-only:", "/myapp/report/r.json",
+                     remote_agent.IGNORE_END]) + "\n"
+    )
+    outputs = [{"path": "myapp/public/my spa", "dir": True}, {"path": "myapp/www/[spa].html", "dir": False}]
 
-    outputs = [{"path": "myapp/public/dist", "dir": True}, {"path": "myapp/www/spa.html", "dir": False}]
-    remote_agent.write_staging_owned(str(repo), owned, outputs)
-    remote_agent.write_staging_owned(str(repo), owned, outputs)  # rewriting must not duplicate the block
+    remote_agent.write_ignore_block(str(repo), outputs)
+    remote_agent.write_ignore_block(str(repo), outputs)  # rewriting must not duplicate the block
 
     text = exclude.read_text()
     assert text.startswith("# user rule\n*.log\n")
-    assert text.count(remote_agent.EXCLUDE_BEGIN) == 1
-    assert sorted(remote_agent.read_staging_owned(str(repo))) == sorted(owned)
-    for name in owned:
+    assert text.count(remote_agent.IGNORE_BEGIN) == 1
+    for name in ("myapp/public/my spa/a.js", "myapp/www/[spa].html", "pkg/__pycache__/x.pyc", "myapp/report/r.json"):
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("")
-    assert git(repo, "status", "--porcelain", "--untracked-files=all") == ""
-
-
-def test_staging_owned_reads_blocks_written_by_0_12_0(tmp_path):
-    repo = init_repo(tmp_path / "repo", commit=False)
-    (repo / ".git" / "info" / "exclude").write_text(
-        "\n".join([
-            remote_agent.EXCLUDE_BEGIN, "__pycache__/", "*.pyc", "node_modules/", "/myapp/public/dist/",
-            "/myapp/report/r.json", remote_agent.EXCLUDE_END,
-        ]) + "\n"
-    )
-
-    assert remote_agent.read_staging_owned(str(repo)) == ["myapp/report/r.json"]
+    # Build outputs and caches are hidden; the formerly hidden staging-only file is visible again.
+    assert git(repo, "status", "--porcelain", "--untracked-files=all") == "?? myapp/report/r.json\n"
 
 
 # --------------------------------------------------------------------------- local git wrapper
@@ -135,7 +139,7 @@ def test_open_requires_git_on_path(tmp_path, monkeypatch):
         LocalRepo.open(tmp_path)
 
 
-def test_snapshot_without_git_identity_falls_back_to_os_user(tmp_path, monkeypatch):
+def test_staged_state_without_git_identity_falls_back_to_os_user(tmp_path, monkeypatch):
     repo = init_repo(tmp_path / "repo")
     git(repo, "config", "--unset", "user.name")
     git(repo, "config", "--unset", "user.email")
@@ -143,22 +147,57 @@ def test_snapshot_without_git_identity_falls_back_to_os_user(tmp_path, monkeypat
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setattr("benchops.gitlocal.getpass.getuser", lambda: "osuser")
-    (repo / "new.txt").write_text("n")
 
     local = LocalRepo.open(repo)
-    snap = local.snapshot("myapp", local.user_name() + "@host")
+    state = local.staged_state(local.user_name() + "@host")
 
-    assert git(repo, "log", "-1", "--format=%an <%ae>", snap.commit).strip() == "osuser <osuser@localhost>"
+    assert git(repo, "log", "-1", "--format=%an <%ae>", state.commit).strip() == "osuser <osuser@localhost>"
     assert local.user_name() == "osuser"
 
 
-def test_snapshot_branch_and_detached_head(tmp_path):
+def test_staged_state_splits_staged_unstaged_untracked_and_leaves_index_alone(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    (repo / "a.txt").write_text("staged")
+    git(repo, "add", "a.txt")
+    (repo / "a.txt").write_text("staged then edited")
+    (repo / "b.txt").write_text("new, staged")
+    git(repo, "add", "b.txt")
+    (repo / "out" / "spa").mkdir(parents=True)
+    (repo / "out" / "spa" / "x.js").write_text("build output")
+    (repo / "notes.txt").write_text("untracked")
+    before = git(repo, "status", "--porcelain")
+
+    state = LocalRepo.open(repo).staged_state("dev@host", ["out/spa"])
+
+    assert state.staged == [("M", "a.txt"), ("A", "b.txt")]
+    assert state.unstaged == [("M", "a.txt")]
+    assert state.untracked == ["notes.txt"]
+    assert git(repo, "show", f"{state.commit}:a.txt") == "staged"
+    assert git(repo, "rev-parse", f"{state.commit}^").strip() == state.base
+    assert git(repo, "status", "--porcelain") == before
+
+
+def test_staged_state_refuses_unresolved_conflicts(tmp_path):
+    repo = init_repo(tmp_path / "repo")
+    git(repo, "checkout", "-q", "-b", "other")
+    (repo / "a.txt").write_text("other")
+    git(repo, "commit", "-qam", "other")
+    git(repo, "checkout", "-q", "-")
+    (repo / "a.txt").write_text("main")
+    git(repo, "commit", "-qam", "main")
+    subprocess.run(["git", "merge", "-q", "other"], cwd=repo, capture_output=True)
+
+    with pytest.raises(GitError, match="unresolved merge conflicts"):
+        LocalRepo.open(repo).staged_state("dev@host")
+
+
+def test_staged_state_branch_and_detached_head(tmp_path):
     repo = init_repo(tmp_path / "repo")
     git(repo, "checkout", "-q", "-b", "feature/x")
-    assert LocalRepo.open(repo).snapshot("myapp", "d").branch == "feature/x"
+    assert LocalRepo.open(repo).staged_state("d").branch == "feature/x"
 
     git(repo, "checkout", "-q", "--detach")
-    assert LocalRepo.open(repo).snapshot("myapp", "d").branch == "(detached)"
+    assert LocalRepo.open(repo).staged_state("d").branch is None
 
 
 # --------------------------------------------------------------------------- agent client
@@ -259,7 +298,8 @@ def deploy_kwargs(monkeypatch):
 
 def test_cli_deploy_passes_flags(deploy_kwargs):
     result = CliRunner().invoke(
-        cli.app, ["deploy", "myapp", "staging", "--site", "s1", "--adopt", "-y", "--force", "--break-lock"]
+        cli.app,
+        ["deploy", "myapp", "staging", "--site", "s1", "-y", "--overwrite", "--force", "--break-lock", "--skip-build"],
     )
 
     assert result.exit_code == 0, result.output
@@ -267,11 +307,11 @@ def test_cli_deploy_passes_flags(deploy_kwargs):
         "server_alias": "staging",
         "app_name": "myapp",
         "site": "s1",
-        "adopt": True,
         "yes": True,
+        "overwrite": True,
         "force": True,
         "break_lock": True,
-        "skip_build": False,
+        "skip_build": True,
         "executed": True,
     }
 
@@ -280,4 +320,22 @@ def test_cli_deploy_defaults_are_safe(deploy_kwargs):
     result = CliRunner().invoke(cli.app, ["deploy", "myapp", "staging"])
 
     assert result.exit_code == 0, result.output
-    assert [deploy_kwargs[k] for k in ("adopt", "yes", "force", "break_lock")] == [False] * 4
+    assert [deploy_kwargs[k] for k in ("yes", "overwrite", "force", "break_lock", "skip_build")] == [False] * 5
+
+
+def test_cli_status_passes_arguments(monkeypatch):
+    captured = {}
+
+    class FakeStatus:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def execute(self):
+            captured["executed"] = True
+
+    monkeypatch.setattr(cli, "StatusCommand", FakeStatus)
+
+    result = CliRunner().invoke(cli.app, ["status", "myapp", "staging", "--files"])
+
+    assert result.exit_code == 0, result.output
+    assert captured == {"server_alias": "staging", "app_name": "myapp", "files": True, "executed": True}
