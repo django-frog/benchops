@@ -18,6 +18,7 @@ from benchops.logs import LogsCommand, LogType
 from benchops.runner import BenchOpsConnectionError
 from benchops.status import StatusCommand
 from benchops.uninstall import UninstallCommand
+from benchops.version import installed_version, render_version_report, update_notice
 
 
 class HookPhase(str, Enum):
@@ -46,6 +47,36 @@ auth_app = typer.Typer(help="Bootstrap and manage BenchOps SSH trust.")
 app.add_typer(auth_app, name="auth")
 
 console = Console()
+err_console = Console(stderr=True)
+
+
+def _show_version(value: bool) -> None:
+    if value:
+        console.print(f"benchops {installed_version()}")
+        raise typer.Exit()
+
+
+@app.callback()
+def main(
+    ctx: typer.Context,
+    version: bool = typer.Option(
+        False, "--version", callback=_show_version, is_eager=True, help="Show the installed version and exit."
+    ),
+) -> None:
+    """A CLI tool to synchronize local Frappe development environments with remote servers."""
+    # On stderr, so it never mixes into a command's own output.
+    if ctx.invoked_subcommand != "version":
+        notice = update_notice()
+        if notice:
+            err_console.print(f"[yellow]{notice}[/yellow]")
+
+
+@app.command("version")
+def version_command(
+    show_all: bool = typer.Option(False, "--all", help="Show the release notes of every version."),
+) -> None:
+    """Show the installed version, whether a newer one is available, and what changed."""
+    render_version_report(console, show_all=show_all)
 
 
 def _render_hook_count(config: dict, key: str) -> str:

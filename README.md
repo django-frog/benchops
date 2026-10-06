@@ -259,7 +259,10 @@ benchops execute staging --site demo.local frappe.client.set_value \
 ### Global Commands
 
 * `benchops init`: Initializes the BenchOps configuration.
-* `benchops deploy <app_name> <server_alias> [--site <site_name>]`: Deploys a local Frappe app to a remote server.
+* `benchops --version`: Prints the installed version.
+* `benchops version [--all]`: Shows the installed version, whether a newer one is on PyPI (with the upgrade command), and the release notes for your version (`--all`: every version). Every other command also prints a one-line notice on stderr when a newer version is available — checked at most once a day; set `BENCHOPS_NO_UPDATE_CHECK=1` to turn it off. See [CHANGELOG.md](CHANGELOG.md).
+* `benchops deploy <app_name> <server_alias> [--site <site_name>]`: Deploys your commits and staged changes to a remote server.
+* `benchops status <app_name> <server_alias> [--files]`: Shows what the server runs and who deployed it.
 * `benchops install <app_name> <server_alias> --site <site_name>`: Executes the install-remote hooks.
 * `benchops uninstall <app_name> <server_alias> --site <site_name>`: Executes the uninstall-remote hooks.
 * `benchops logs <server_alias> [--type frappe.log|web.error.log|worker.error.log]`: Tails bench logs in real time (Ctrl+C to stop).
