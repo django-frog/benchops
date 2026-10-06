@@ -106,8 +106,12 @@ class LocalRepo:
                 env.setdefault(f"GIT_{role}_EMAIL", f"{user}@localhost")
         return env
 
-    def snapshot(self, app_name: str, deployer: str) -> Snapshot:
-        """Commit the current working tree on top of HEAD using a throwaway index."""
+    def snapshot(self, app_name: str, deployer: str, build_outputs: list[str] = ()) -> Snapshot:
+        """Commit the current working tree on top of HEAD using a throwaway index.
+
+        Build outputs are dropped from the snapshot even if they are tracked
+        (e.g. an SPA build committed before it was gitignored); they ship
+        separately, straight from the build."""
         base = self._git("rev-parse", "HEAD").strip()
         branch = self.branch()
         index = Path(self._git("rev-parse", "--git-path", "index").strip())
@@ -121,18 +125,22 @@ class LocalRepo:
             env = self._identity_env(dict(os.environ, GIT_INDEX_FILE=str(tmp_index)))
             self._git("add", "-A", env=env)
             # Build output and caches never belong in the snapshot, even when
-            # the app's .gitignore forgets them; dist ships separately.
+            # the app's .gitignore forgets them.
             self._git(
                 "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--",
                 ":(glob)**/__pycache__/**",
                 ":(glob)**/*.pyc",
                 ":(glob)**/node_modules/**",
                 f":(glob){app_name}/public/dist/**",
+                *[f":(literal){path}" for path in build_outputs],
                 env=env,
             )
             tree = self._git("write-tree", env=env).strip()
 
-        uncommitted = self._name_status(base, tree)
+        uncommitted = [
+            (status, path) for status, path in self._name_status(base, tree)
+            if not any(path == out or path.startswith(out + "/") for out in build_outputs)
+        ]
         message = f"benchops snapshot: {branch}@{base[:10]}"
         if uncommitted:
             message += f" + {len(uncommitted)} uncommitted file(s)"

@@ -16,7 +16,9 @@ Ownership model on the remote app directory:
   * files in the deployed snapshot belong to local and are reset to it;
   * files git has never tracked there were created on staging (e.g. via
     Desk in developer_mode); they are listed in a BenchOps-managed block of
-    .git/info/exclude, so they stay out of git and are never touched.
+    .git/info/exclude, so they stay out of git and are never touched;
+  * build outputs (public/dist, SPA builds) are never in git: each deploy
+    that ships them replaces the remote copy wholesale.
 """
 
 import hashlib
@@ -32,6 +34,7 @@ import time
 RESULT_MARKER = "BENCHOPS_RESULT:"
 EXCLUDE_BEGIN = "# >>> benchops: staging-only files (managed, do not edit) >>>"
 EXCLUDE_END = "# <<< benchops <<<"
+EXCLUDE_OWNED = "# staging-only:"
 INCOMING_REF = "refs/benchops/incoming"
 DEPLOYED_REF = "refs/benchops/deployed"
 MANIFEST_NAMES = ("assets.json", "assets-rtl.json")
@@ -129,24 +132,32 @@ def exclude_path(app_dir):
     return os.path.join(app_dir, ".git", "info", "exclude")
 
 
+def escape_pattern(path):
+    return re.sub(r"([\\*?\[\]#! ])", r"\\\1", path)
+
+
 def read_staging_owned(app_dir):
     try:
         with open(exclude_path(app_dir)) as f:
             lines = f.read().splitlines()
     except FileNotFoundError:
         return []
-    owned, inside = [], False
+    block, inside = [], False
     for line in lines:
         if line == EXCLUDE_BEGIN:
             inside = True
         elif line == EXCLUDE_END:
             inside = False
-        elif inside and line.startswith("/") and not line.endswith("/"):
-            owned.append(re.sub(r"\\(.)", r"\1", line[1:]))
-    return owned
+        elif inside:
+            block.append(line)
+    if EXCLUDE_OWNED in block:
+        entries = block[block.index(EXCLUDE_OWNED) + 1:]
+    else:  # blocks written by 0.12.0 had no section marker
+        entries = [line for line in block if line.startswith("/") and not line.endswith("/")]
+    return [re.sub(r"\\(.)", r"\1", line[1:]) for line in entries if line.startswith("/")]
 
 
-def write_staging_owned(app_dir, app, owned):
+def write_staging_owned(app_dir, owned, build_outputs):
     path = exclude_path(app_dir)
     try:
         with open(path) as f:
@@ -162,15 +173,21 @@ def write_staging_owned(app_dir, app, owned):
         elif not inside:
             kept.append(line)
 
-    # Build output and caches are never staging-owned, whatever the app's
+    # Build outputs and caches are never staging-owned, whatever the app's
     # .gitignore says; listing them keeps them out of the untracked set.
-    block = [EXCLUDE_BEGIN, "__pycache__/", "*.pyc", "node_modules/", "/%s/public/dist/" % app]
-    block += ["/" + re.sub(r"([\\*?\[\]#! ])", r"\\\1", p) for p in sorted(owned)]
+    block = [EXCLUDE_BEGIN, "__pycache__/", "*.pyc", "node_modules/"]
+    block += ["/" + escape_pattern(o["path"]) + ("/" if o["dir"] else "") for o in build_outputs]
+    block.append(EXCLUDE_OWNED)
+    block += ["/" + escape_pattern(p) for p in sorted(owned)]
     block.append(EXCLUDE_END)
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write("\n".join(kept + block) + "\n")
+
+
+def under_outputs(path, build_outputs):
+    return any(path == o["path"] or path.startswith(o["path"] + "/") for o in build_outputs)
 
 
 def frappe_version():
@@ -226,8 +243,8 @@ def cmd_inspect(args):
             raise AgentError("locked", lock=read_json(path))
         write_json(path, lock)
 
-    # Make sure caches and build output are ignored before anything is listed.
-    write_staging_owned(app_dir, app, read_staging_owned(app_dir))
+    # Make sure caches and build outputs are ignored before anything is listed.
+    write_staging_owned(app_dir, read_staging_owned(app_dir), args.get("build_outputs", []))
 
     head = rev(app_dir, "HEAD")
     return {
@@ -278,11 +295,15 @@ def cmd_preview(args):
         changes = git_z(app_dir, "diff", "-z", "--name-only", "--no-renames", head, new)
     else:
         changes = sorted(new_files)
+    # Build outputs committed by older deploys leave the tree but are
+    # replaced by the shipped build, so they are not real deletions.
+    outputs = args.get("build_outputs", [])
+    changes = [p for p in changes if not under_outputs(p, outputs)]
 
     return {
         "new": new,
         "changes": changes,
-        "deletions": sorted(head_files - new_files),
+        "deletions": sorted(p for p in head_files - new_files if not under_outputs(p, outputs)),
         "staging_edits": tracked_changes(app_dir) if head else [],
         "staging_owned": sorted(owned - collisions),
         "staging_new": sorted(untracked - collisions),
@@ -349,18 +370,26 @@ def cmd_apply(args):
             parent = os.path.dirname(parent)
 
     git(app_dir, "checkout", "-q", "-f", "--detach", new)
-    write_staging_owned(app_dir, app, args.get("keep", []))
+    write_staging_owned(app_dir, args.get("keep", []), args.get("build_outputs", []))
 
-    shipped_dist = os.path.join(incoming, "dist")
-    if os.path.isdir(shipped_dist):
-        dist = os.path.join(app_dir, app, "public", "dist")
-        os.makedirs(os.path.dirname(dist), exist_ok=True)
-        shutil.rmtree(dist, ignore_errors=True)
-        os.rename(shipped_dist, dist)
-        manifests = read_json(os.path.join(incoming, "manifests.json"), {})
-        warning = merge_manifests(app, manifests)
+    meta = read_json(os.path.join(incoming, "meta.json"), {})
+    shipped = meta.get("build_outputs", [])
+    for rel in shipped:
+        source = os.path.join(incoming, "build", rel)
+        if not os.path.lexists(source):
+            raise AgentError("build output %s is missing from the deploy package" % rel)
+        target = safe_join(app_dir, rel)
+        if os.path.isdir(target) and not os.path.islink(target):
+            shutil.rmtree(target)
+        elif os.path.lexists(target):
+            os.remove(target)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        os.rename(source, target)
+    if shipped:
+        warning = merge_manifests(app, read_json(os.path.join(incoming, "manifests.json"), {}))
         if warning:
             result["warnings"].append(warning)
+    result["build_outputs"] = shipped
 
     tree = rev(app_dir, "HEAD^{tree}")
     if tree != args["record"]["tree"] or tracked_changes(app_dir):

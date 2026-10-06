@@ -115,7 +115,7 @@ You can write generic hooks that apply to any deployment by using these placehol
 
 **Available Lifecycle Phases:**
 
-* `pre-local`: Runs on your local machine before archiving (e.g., `bench build --app {app}`).
+* `pre-local`: Runs on your local machine before the build and snapshot (e.g., `bench --site {site} export-fixtures --app {app}`). Don't add `bench build` here — every deploy builds the app itself.
 * `pre-remote`: Runs on the remote server before the new code is extracted (e.g., enabling maintenance mode).
 * `post-remote`: Runs on the remote server after extraction (e.g., database migrations, clearing cache).
 * `install-remote`: Runs exactly once when using the `install` command (e.g., `bench --site {site} install-app {app}`).
@@ -154,17 +154,27 @@ benchops deploy custom_app staging --site test-16.akwad.qa --adopt
 
 **What a deploy does:**
 
-1. `pre-local` hooks run — this is where `bench build --app {app}` belongs.
-2. Your working tree is committed as a *snapshot* on top of HEAD using a throwaway index — your branch, staging area, and stash are never touched. Ignored files, `__pycache__`, `node_modules`, and `public/dist` are never part of it.
-3. On the server, BenchOps takes the app's deploy lock and checks the current state. It stops if the server runs commits that aren't in your history (pull or rebase first), or if the app's HEAD was moved outside BenchOps.
-4. One package is uploaded: a git bundle with only the commits the server is missing, the built `public/dist/` (when it changed), and this app's entries from the local `sites/assets/assets*.json`.
-5. A **deploy plan** is shown — base branch and commit, uncommitted files being shipped, files removed from the server, staging edits that will be overwritten, staging-only files kept, suggested follow-up steps (`migrate`, `restart`, `setup requirements`), and warnings (branch switch, unpushed commits, Frappe version mismatch). Confirm it, or pass `--yes`.
-6. `pre-remote` hooks run, then the snapshot is checked out on the server. Staging edits to deployed files are first saved under `refs/benchops/overwritten/<timestamp>`; staging-only files are listed in the BenchOps block of `.git/info/exclude`, so they stay out of git and survive every deploy. `public/dist/` is replaced, the manifests are merged (other apps' entries untouched), and `assets_json` is cleared from `redis_cache`.
-7. The server's tree hash is verified against your snapshot, the deploy record is written to `apps/<app>/.git/benchops/`, and `post-remote` hooks run (e.g. `bench --site {site} migrate` and `bench restart`). The lock is always released.
+1. `pre-local` hooks run.
+2. The app is built locally: `yarn install` in the app (when it has a `package.json`), then `bench build --app <app>`. `bench build` also runs the app's own `build` script, which is how frappe-ui/Vite SPA frontends are built. BenchOps then checks that every build output exists and that built HTML only references `/assets/<app>/…` files that exist, so a stale or partial build fails here instead of as a blank page.
+3. Your working tree is committed as a *snapshot* on top of HEAD using a throwaway index — your branch, staging area, and stash are never touched. Ignored files, `__pycache__`, `node_modules`, and build outputs are never part of it.
+4. On the server, BenchOps takes the app's deploy lock and checks the current state. It stops if the server runs commits that aren't in your history (pull or rebase first), or if the app's HEAD was moved outside BenchOps.
+5. One package is uploaded: a git bundle with only the commits the server is missing, the build outputs (when any of them changed), and this app's entries from the local `sites/assets/assets*.json`.
+6. A **deploy plan** is shown — base branch and commit, uncommitted files being shipped, files removed from the server, staging edits that will be overwritten, staging-only files kept, suggested follow-up steps (`migrate`, `restart`, `setup requirements`), and warnings (branch switch, unpushed commits, Frappe version mismatch). Confirm it, or pass `--yes`.
+7. `pre-remote` hooks run, then the snapshot is checked out on the server. Staging edits to deployed files are first saved under `refs/benchops/overwritten/<timestamp>`; staging-only files are listed in the BenchOps block of `.git/info/exclude`, so they stay out of git and survive every deploy. Each shipped build output replaces the server's copy wholesale (no stale hashed files survive), the manifests are merged (other apps' entries untouched), and `assets_json` is cleared from `redis_cache`.
+8. The server's tree hash is verified against your snapshot, the deploy record is written to `apps/<app>/.git/benchops/`, `bench --site all clear-cache` runs if build outputs were shipped, and `post-remote` hooks run (e.g. `bench --site {site} migrate` and `bench restart`). The lock is always released.
 
 If nothing changed since the last deploy, BenchOps says so and exits without touching the server. If a file changes on the server while the plan is on screen (e.g. a Desk save), nothing is applied and you re-run the deploy.
 
-**Options:** `--adopt` (first deploy), `--yes`/`-y` (skip confirmation), `--force` (deploy over commits missing from your history, or a moved HEAD), `--break-lock` (take over a stale lock).
+**Options:** `--adopt` (first deploy), `--yes`/`-y` (skip confirmation), `--force` (deploy over commits missing from your history, or a moved HEAD), `--break-lock` (take over a stale lock), `--skip-build` (ship the existing build without rebuilding).
+
+**Build outputs and SPA frontends.** Build outputs are paths a build regenerates. They are shipped straight from the build and never through git, even if an old build was committed. `<app>/public/dist` is always one. For a frappe-ui/Vite frontend, the `outDir` and `indexHtmlPath` in its `vite.config.*` (at the app root or one level below, e.g. `frontend/`) are detected automatically. To declare them explicitly, or to turn detection off with an empty list, use the app's `pyproject.toml`:
+
+```toml
+[tool.benchops]
+build_outputs = ["basma/public/calendar", "basma/www/calendar.html"]
+```
+
+If a build output is tracked in git, the plan warns you. Untrack it (`git rm -r --cached <path>`) and gitignore it, so a rebuild never shows up as a code change.
 
 > Desk changes that only live in the database (Custom Fields, Property Setters, Client Scripts) are not files and are not synced. Export them as fixtures (`bench --site {site} export-fixtures --app {app}`, e.g. as a `pre-local` hook) so they become part of the snapshot.
 

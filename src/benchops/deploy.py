@@ -1,13 +1,14 @@
 """Deployment command logic: git-based sync of a local app to a remote bench.
 
 Pipeline:
-  1. local    pre-local hooks, snapshot commit, asset manifests
+  1. local    pre-local hooks, build (yarn install + bench build), build
+              output checks, snapshot commit, asset manifests
   2. remote   inspect + lock (one agent call)
   3. local    assess: ancestry, HEAD drift, branch switch, unpushed, Frappe version
   4. both     upload one package (git bundle + dist + manifests), preview the file plan
   5. local    render the plan, confirm
   6. remote   pre-remote hooks, apply (backup, checkout, dist, manifests, record),
-              post-remote hooks; the lock is always released
+              cache clear, post-remote hooks; the lock is always released
 """
 
 import posixpath
@@ -25,13 +26,22 @@ from rich.console import Console
 
 from benchops.assets import collect_app_manifests, resolve_bench_path
 from benchops.base import BaseCommand
+from benchops.build import (
+    BuildError,
+    check_html_asset_references,
+    existing_outputs,
+    load_build_outputs,
+    outputs_digest,
+    run_build,
+)
 from benchops.gitlocal import GitError, LocalRepo, Snapshot
 from benchops.runner import BenchOpsConnectionError, LocalRunner
-from benchops.sync import RemoteAgent, RemoteAgentError, build_package, dist_digest
+from benchops.sync import RemoteAgent, RemoteAgentError, build_package
 
 console = Console()
 
 PLAN_LIST_LIMIT = 15
+_BENCH_BUILD_RE = re.compile(r"\bbench\b.*\sbuild\b")
 _VERSION_RE = re.compile(r"^__version__\s*=\s*['\"]([^'\"]+)['\"]", re.M)
 
 
@@ -145,12 +155,14 @@ class DeployCommand(BaseCommand):
         yes: bool = False,
         force: bool = False,
         break_lock: bool = False,
+        skip_build: bool = False,
     ) -> None:
         super().__init__(server_alias, app_name, site)
         self.adopt = adopt
         self.yes = yes
         self.force = force
         self.break_lock = break_lock
+        self.skip_build = skip_build
 
     def _resolve_app_dir(self) -> Path:
         """Locate the local application directory."""
@@ -196,7 +208,7 @@ class DeployCommand(BaseCommand):
         return sorted(keep | set(candidates)), []
 
     def _render_plan(
-        self, snap: Snapshot, state: dict, preview: dict, warnings: list[str], delete: list[str], ship_dist: bool
+        self, snap: Snapshot, state: dict, preview: dict, warnings: list[str], delete: list[str], shipped: list[str]
     ) -> None:
         record = state.get("record") or {}
         console.rule(f"Deploy plan: {self.app_name} → {self.server_alias}")
@@ -223,7 +235,10 @@ class DeployCommand(BaseCommand):
             _print_list("Staging-only files now tracked locally (local wins)", preview["collisions"], "yellow")
         _print_list("Staging-only files left inside folders this deploy removes", preview["orphans"], "yellow")
         _print_list("Deleted on the server (adoption)", delete, "red")
-        console.print(f"Built assets: {'shipped' if ship_dist else 'unchanged'}")
+        if shipped:
+            _print_list("Build outputs (replaced on the server)", shipped, "cyan")
+        else:
+            console.print("Build outputs: unchanged")
         steps = required_steps(self.app_name, preview["changes"])
         if steps:
             console.print(f"Changes suggest: {', '.join(steps)}")
@@ -242,19 +257,38 @@ class DeployCommand(BaseCommand):
             bench = resolve_bench_path(app_dir)
             repo = LocalRepo.open(app_dir)
 
-            self._run_hooks(LocalRunner(), "pre_local_commands", "pre-local", server_config, str(app_dir.parent), False)
+            local_runner = LocalRunner()
+            self._run_hooks(local_runner, "pre_local_commands", "pre-local", server_config, str(app_dir.parent), True)
+
+            build_outputs = load_build_outputs(app_dir, app)
+            if self.skip_build:
+                console.print("[yellow]Skipping the local build (--skip-build).[/yellow]")
+            else:
+                if any(_BENCH_BUILD_RE.search(cmd) for cmd in server_config.get("pre_local_commands", [])):
+                    console.print(
+                        "[yellow]Warning: a pre-local hook runs 'bench build', and BenchOps now builds "
+                        "the app itself; remove the hook to avoid building twice.[/yellow]"
+                    )
+                console.print(f"[yellow]Building '{app}' locally...[/yellow]")
+                run_build(local_runner, app_dir, bench, app)
+            present_outputs = existing_outputs(app_dir, build_outputs)
+            check_html_asset_references(app_dir, app, present_outputs)
 
             deployer = f"{repo.user_name()}@{socket.gethostname()}"
-            snap = repo.snapshot(app, deployer)
+            snap = repo.snapshot(app, deployer, build_outputs)
             manifests = collect_app_manifests(bench, app)
-            dist_dir = app_dir / app / "public" / "dist"
-            if repo.is_tracked(f"{app}/public/dist"):
-                console.print(
-                    f"[yellow]Warning: {app}/public/dist is tracked in git; add it to .gitignore, "
-                    "build output is shipped separately.[/yellow]"
-                )
-            digest = dist_digest(dist_dir)
-        except (subprocess.CalledProcessError, BenchOpsConnectionError, FileNotFoundError, GitError) as exc:
+            digest = outputs_digest(app_dir, present_outputs)
+            local_warnings = [
+                f"{rel} is a build output but is tracked in git; it is shipped from the build, not from git. "
+                f"Untrack it: git rm -r --cached {rel} (and add it to .gitignore)."
+                for rel in build_outputs
+                if repo.is_tracked(rel)
+            ]
+            output_specs = [
+                {"path": rel, "dir": (app_dir / rel).is_dir() or not (app_dir / rel).exists()}
+                for rel in build_outputs
+            ]
+        except (subprocess.CalledProcessError, BenchOpsConnectionError, FileNotFoundError, GitError, BuildError) as exc:
             console.print(f"[red]Deployment failed: {exc}[/red]")
             raise typer.Exit(1)
 
@@ -268,14 +302,18 @@ class DeployCommand(BaseCommand):
                     app=app,
                     adopt=self.adopt,
                     break_lock=self.break_lock,
+                    build_outputs=output_specs,
                     lock={"token": token, "owner": deployer, "started": time.strftime("%Y-%m-%d %H:%M:%S")},
                 )
-                warnings = assess(state, repo, snap, deployer, local_frappe_version(bench), self.adopt, self.force)
+                warnings = local_warnings + assess(
+                    state, repo, snap, deployer, local_frappe_version(bench), self.adopt, self.force
+                )
 
                 record = state.get("record") or {}
                 ship_code = self.adopt or state.get("tree") != snap.tree or record.get("base") != snap.base
-                ship_dist = digest is not None and digest != record.get("dist_digest")
-                if not (ship_code or ship_dist or state["staging_edits"]):
+                ship_build = digest is not None and digest != record.get("build_digest")
+                shipped = present_outputs if ship_build else []
+                if not (ship_code or ship_build or state["staging_edits"]):
                     console.print(f"[green]'{app}' on '{self.server_alias}' is already up to date ({snap.tree[:10]}).[/green]")
                     return
 
@@ -293,15 +331,18 @@ class DeployCommand(BaseCommand):
                         Path(tmp) / "package.tar.gz",
                         meta,
                         bundle_path=bundle,
-                        dist_dir=dist_dir if ship_dist else None,
-                        manifests=manifests if ship_dist else None,
+                        app_dir=app_dir,
+                        build_outputs=shipped,
+                        manifests=manifests if ship_build else None,
                     )
                     console.print("[yellow]Uploading deploy package...[/yellow]")
                     remote_runner.put(str(package), package_remote)
 
-                preview = agent.call("preview", app=app, token=token, package=package_remote)
+                preview = agent.call(
+                    "preview", app=app, token=token, package=package_remote, build_outputs=output_specs
+                )
                 keep, delete = self._classify_staging_files(preview)
-                self._render_plan(snap, state, preview, warnings, delete, ship_dist)
+                self._render_plan(snap, state, preview, warnings, delete, shipped)
                 if not self.yes and not typer.confirm("Proceed with deploy?", default=False):
                     raise DeployAborted("Cancelled.")
 
@@ -315,6 +356,7 @@ class DeployCommand(BaseCommand):
                     new=preview["new"],
                     keep=keep,
                     delete=delete,
+                    build_outputs=output_specs,
                     record={
                         "app": app,
                         "branch": snap.branch,
@@ -323,7 +365,7 @@ class DeployCommand(BaseCommand):
                         "deployer": deployer,
                         "deployed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                         "uncommitted": [path for _, path in snap.uncommitted],
-                        "dist_digest": digest if digest is not None else record.get("dist_digest"),
+                        "build_digest": digest if digest is not None else record.get("build_digest"),
                     },
                 )
                 if result.get("backup_ref"):
@@ -331,6 +373,8 @@ class DeployCommand(BaseCommand):
                 for warning in result.get("warnings", []):
                     console.print(f"[yellow]Warning: {warning}[/yellow]")
                 console.print(f"[green]Server now runs tree {result['tree'][:10]} (verified).[/green]")
+                if result.get("build_outputs"):
+                    self._clear_remote_cache(remote_runner, bench_path)
 
                 self._run_hooks(remote_runner, "post_remote_commands", "post-remote", server_config, bench_path, True)
                 console.print(f"[green]Successfully deployed '{app}' to '{self.server_alias}'.[/green]")
@@ -351,6 +395,18 @@ class DeployCommand(BaseCommand):
                     agent.call("release", app=app, token=token, package=package_remote)
                 except (RemoteAgentError, BenchOpsConnectionError) as exc:
                     console.print(f"[yellow]Warning: could not release the deploy lock: {exc}[/yellow]")
+
+    def _clear_remote_cache(self, runner, bench_path: str) -> None:
+        """New build outputs change asset hashes; clear Frappe's caches on
+        every site so pages and boot info stop pointing at the old ones."""
+        console.print("[yellow]Clearing caches on the server (new build outputs)...[/yellow]")
+        try:
+            runner.run("bench --site all clear-cache", cwd=bench_path)
+        except (subprocess.CalledProcessError, UnexpectedExit, BenchOpsConnectionError) as exc:
+            console.print(
+                f"[yellow]Warning: 'bench --site all clear-cache' failed ({exc}); "
+                "run it on the server, or the old asset paths may still be served.[/yellow]"
+            )
 
     def _describe_agent_error(self, exc: RemoteAgentError) -> str:
         if exc.error == "not_repo":

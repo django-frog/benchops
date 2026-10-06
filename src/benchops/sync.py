@@ -2,13 +2,12 @@
 
 A deploy package is a single .tar.gz uploaded per deploy:
 
-    meta.json          what the package carries (bundle ref, ...)
+    meta.json          what the package carries (bundle ref, build outputs)
     snapshot.bundle    git objects the remote is missing (optional)
-    dist/              the app's locally built public/dist (optional)
+    build/<path>       each shipped build output, by path in the app
     manifests.json     the app's entries from sites/assets/assets*.json
 """
 
-import hashlib
 import json
 import shlex
 import tarfile
@@ -60,17 +59,6 @@ class RemoteAgent:
         return result
 
 
-def dist_digest(dist_dir: Path) -> str | None:
-    """Content hash of a build output directory, or None if it doesn't exist."""
-    if not dist_dir.is_dir():
-        return None
-    digest = hashlib.sha256()
-    for path in sorted(p for p in dist_dir.rglob("*") if p.is_file()):
-        digest.update(path.relative_to(dist_dir).as_posix().encode() + b"\0")
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
 def _neutral_owner(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo:
     """Don't carry the developer's uid/username to the server."""
     tarinfo.uid = tarinfo.gid = 0
@@ -82,20 +70,22 @@ def build_package(
     output_path: Path,
     meta: dict,
     bundle_path: Path | None = None,
-    dist_dir: Path | None = None,
+    app_dir: Path | None = None,
+    build_outputs: list[str] | None = None,
     manifests: dict | None = None,
 ) -> Path:
-    """Write the deploy package and return its path."""
+    """Write the deploy package and return its path. Build outputs are stored
+    under build/<path relative to the app> and listed in meta.json."""
     staging = output_path.parent
+    meta = dict(meta, build_outputs=list(build_outputs or []))
     (staging / "meta.json").write_text(json.dumps(meta))
-    if manifests is not None:
-        (staging / "manifests.json").write_text(json.dumps(manifests))
+    (staging / "manifests.json").write_text(json.dumps(manifests or {}))
 
     with tarfile.open(output_path, mode="w:gz") as tar:
         tar.add(staging / "meta.json", arcname="meta.json", filter=_neutral_owner)
+        tar.add(staging / "manifests.json", arcname="manifests.json", filter=_neutral_owner)
         if bundle_path is not None:
             tar.add(bundle_path, arcname="snapshot.bundle", filter=_neutral_owner)
-        if dist_dir is not None:
-            tar.add(dist_dir, arcname="dist", filter=_neutral_owner)
-            tar.add(staging / "manifests.json", arcname="manifests.json", filter=_neutral_owner)
+        for rel in meta["build_outputs"]:
+            tar.add(app_dir / rel, arcname=f"build/{rel}", filter=_neutral_owner)
     return output_path

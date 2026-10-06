@@ -292,6 +292,9 @@ def deploy(
         False, "--force", help="Deploy even if the server runs commits missing from your history, or its HEAD moved."
     ),
     break_lock: bool = typer.Option(False, "--break-lock", help="Take over a stale deploy lock left on the server."),
+    skip_build: bool = typer.Option(
+        False, "--skip-build", help="Don't run 'yarn install' and 'bench build' locally; ship the existing build."
+    ),
 ) -> None:
     """Deploy a local Frappe app to a remote server as a verified git snapshot."""
     command = DeployCommand(
@@ -302,6 +305,7 @@ def deploy(
         yes=yes,
         force=force,
         break_lock=break_lock,
+        skip_build=skip_build,
     )
     command.execute()
 

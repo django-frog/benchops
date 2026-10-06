@@ -17,7 +17,8 @@ from benchops.deploy import required_steps
 from benchops.gitlocal import GitError, LocalRepo
 from benchops.runner import BenchOpsCommandError
 from benchops.remote_agent import RESULT_MARKER
-from benchops.sync import RemoteAgent, RemoteAgentError, dist_digest
+from benchops.build import outputs_digest
+from benchops.sync import RemoteAgent, RemoteAgentError
 
 
 def git(cwd, *args):
@@ -77,8 +78,9 @@ def test_staging_owned_round_trip_escapes_special_characters(tmp_path):
     exclude.write_text("# user rule\n*.log\n")
     owned = ["myapp/report/a b/[x].json", "myapp/#hash.json", "myapp/!bang.json"]
 
-    remote_agent.write_staging_owned(str(repo), "myapp", owned)
-    remote_agent.write_staging_owned(str(repo), "myapp", owned)  # rewriting must not duplicate the block
+    outputs = [{"path": "myapp/public/dist", "dir": True}, {"path": "myapp/www/spa.html", "dir": False}]
+    remote_agent.write_staging_owned(str(repo), owned, outputs)
+    remote_agent.write_staging_owned(str(repo), owned, outputs)  # rewriting must not duplicate the block
 
     text = exclude.read_text()
     assert text.startswith("# user rule\n*.log\n")
@@ -89,6 +91,18 @@ def test_staging_owned_round_trip_escapes_special_characters(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("")
     assert git(repo, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+def test_staging_owned_reads_blocks_written_by_0_12_0(tmp_path):
+    repo = init_repo(tmp_path / "repo", commit=False)
+    (repo / ".git" / "info" / "exclude").write_text(
+        "\n".join([
+            remote_agent.EXCLUDE_BEGIN, "__pycache__/", "*.pyc", "node_modules/", "/myapp/public/dist/",
+            "/myapp/report/r.json", remote_agent.EXCLUDE_END,
+        ]) + "\n"
+    )
+
+    assert remote_agent.read_staging_owned(str(repo)) == ["myapp/report/r.json"]
 
 
 # --------------------------------------------------------------------------- local git wrapper
@@ -189,19 +203,24 @@ def test_agent_call_reports_crashes_and_missing_results():
         RemoteAgent(silent, "/b").call("apply")
 
 
-def test_dist_digest_tracks_content_and_names(tmp_path):
-    assert dist_digest(tmp_path / "missing") is None
+def test_outputs_digest_tracks_content_and_names(tmp_path):
+    assert outputs_digest(tmp_path, ["missing"]) is None
     dist = tmp_path / "dist"
     (dist / "js").mkdir(parents=True)
     (dist / "js" / "a.js").write_text("1")
-    first = dist_digest(dist)
+    (tmp_path / "spa.html").write_text("<html>")
+    outputs = ["dist", "spa.html"]
+    first = outputs_digest(tmp_path, outputs)
 
     (dist / "js" / "a.js").write_text("2")
-    assert dist_digest(dist) != first
+    assert outputs_digest(tmp_path, outputs) != first
     (dist / "js" / "a.js").write_text("1")
-    assert dist_digest(dist) == first
+    assert outputs_digest(tmp_path, outputs) == first
+    (tmp_path / "spa.html").write_text("<html>new")
+    assert outputs_digest(tmp_path, outputs) != first
+    (tmp_path / "spa.html").write_text("<html>")
     (dist / "js" / "a.js").rename(dist / "js" / "b.js")
-    assert dist_digest(dist) != first
+    assert outputs_digest(tmp_path, outputs) != first
 
 
 # --------------------------------------------------------------------------- deploy helpers and CLI
@@ -252,6 +271,7 @@ def test_cli_deploy_passes_flags(deploy_kwargs):
         "yes": True,
         "force": True,
         "break_lock": True,
+        "skip_build": False,
         "executed": True,
     }
 

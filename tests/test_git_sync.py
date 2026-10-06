@@ -57,8 +57,27 @@ def make_local_bench(root, user="Dev", clone_from=None):
     return app
 
 
+def fake_tools(tmp_path, monkeypatch):
+    """Stand-ins for `bench` and `yarn` on PATH that log each call as
+    "<tool> <cwd> <args>"; returns the log file."""
+    bin_dir, log = tmp_path / "bin", tmp_path / "tools.log"
+    bin_dir.mkdir()
+    for tool in ("bench", "yarn"):
+        script = bin_dir / tool
+        script.write_text(f'#!/bin/sh\necho "{tool} $PWD $*" >> "{log}"\n')
+        script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    log.write_text("")
+    return log
+
+
 @pytest.fixture
-def benches(tmp_path, monkeypatch):
+def tools_log(tmp_path, monkeypatch):
+    return fake_tools(tmp_path, monkeypatch)
+
+
+@pytest.fixture
+def benches(tmp_path, monkeypatch, tools_log):
     local, remote = tmp_path / "local", tmp_path / "remote"
     make_local_bench(local)
 
@@ -383,9 +402,9 @@ def test_asset_only_change_replaces_dist_and_manifest(benches, capsys):
     assert assets["myapp.bundle.js"] == new_bundle
     assert assets["desk.bundle.js"] == "/assets/frappe/dist/js/desk.bundle.F.js"
     assert record(remote)["snapshot"] == before["snapshot"]
-    assert record(remote)["dist_digest"] != before["dist_digest"]
+    assert record(remote)["build_digest"] != before["build_digest"]
     assert "myapp.removed.bundle.js" not in assets
-    assert "Built assets: shipped" in capsys.readouterr().out
+    assert "Build outputs (replaced on the server): 1" in capsys.readouterr().out
 
 
 def test_head_moved_on_server_blocks_unless_forced(benches):
@@ -520,3 +539,122 @@ def test_lock_taken_over_mid_deploy_applies_nothing(benches, monkeypatch):
 
     assert not (remote / "apps" / APP / APP / "api.py").exists()
     assert json.loads(lock.read_text())["token"] == "other"
+
+
+VITE_CONFIG = """
+export default defineConfig({
+	plugins: [frappeui({ buildConfig: { outDir: "../myapp/public/spa", indexHtmlPath: "../myapp/www/spa.html" } })],
+	build: { outDir: "../myapp/public/spa", emptyOutDir: true },
+})
+"""
+
+
+def spa_html(asset):
+    return f'<script type="module" src="/assets/myapp/spa/assets/{asset}"></script>\n'
+
+
+def build_spa(app, asset):
+    """What `vite build` with emptyOutDir does: wipe the output, write new hashes and the HTML."""
+    subprocess.run(["rm", "-rf", str(app / APP / "public" / "spa")], check=True)
+    write(app / APP / "public" / "spa" / "assets" / asset, f"// {asset}")
+    write(app / APP / "www" / "spa.html", spa_html(asset))
+
+
+def test_spa_build_ships_even_when_committed_then_gitignored(benches, capsys):
+    """Regression for the blank-page bug: the SPA build was committed before
+    `public/spa/*` was gitignored, so a rebuild left the new hashed files
+    ignored (never in the snapshot) while the tracked HTML pointed at them."""
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / "frontend" / "vite.config.js", VITE_CONFIG)
+    build_spa(app, "index-OLD.js")
+    git(app, "add", "-A")
+    git(app, "commit", "-q", "-m", "commit a build")
+    write(app / ".gitignore", "myapp/public/dist/\nmyapp/public/spa/*\n")
+    git(app, "commit", "-q", "-am", "ignore the build")
+    deploy(remote, adopt=True)
+    assert (rapp / APP / "public" / "spa" / "assets" / "index-OLD.js").is_file()
+
+    build_spa(app, "index-NEW.js")
+    capsys.readouterr()
+    deploy(remote)
+
+    out = flat(capsys.readouterr().out)
+    assert (rapp / APP / "www" / "spa.html").read_text() == spa_html("index-NEW.js")
+    assert sorted(p.name for p in (rapp / APP / "public" / "spa" / "assets").iterdir()) == ["index-NEW.js"]
+    assert remote_status(remote) == ""
+    assert "/myapp/public/spa/" in staging_owned(remote)
+    assert "/myapp/www/spa.html" in staging_owned(remote)
+    assert "spa" not in " ".join(record(remote)["uncommitted"])
+    # Build outputs live outside the deployed tree, so a rebuild alone is not a code change.
+    assert not [f for f in git(rapp, "ls-tree", "-r", "--name-only", "HEAD").split() if "spa" in f]
+    assert "myapp/public/spa is a build output but is tracked in git" in out
+    assert "Removed from the server" not in out
+
+
+def test_build_runs_locally_and_cache_is_cleared_on_the_server(benches, tools_log):
+    local, remote = benches
+    app = local / "apps" / APP
+    write(app / "package.json", '{"scripts": {"build": "cd frontend && yarn build"}}')
+
+    deploy(remote, adopt=True)
+
+    assert tools_log.read_text().splitlines() == [
+        f"yarn {app} install",
+        f"bench {local} build --app {APP}",
+        f"bench {remote} --site all clear-cache",
+    ]
+
+
+def test_skip_build_ships_the_existing_build(benches, tools_log):
+    local, remote = benches
+    write(local / "apps" / APP / "package.json", "{}")
+
+    deploy(remote, adopt=True, skip_build=True)
+
+    assert tools_log.read_text().splitlines() == [f"bench {remote} --site all clear-cache"]
+    assert (remote / "apps" / APP / APP / "public" / "dist" / "js" / "myapp.bundle.AAA.js").is_file()
+
+
+def test_cache_is_not_cleared_when_build_outputs_are_unchanged(benches, tools_log):
+    local, remote = benches
+    deploy(remote, adopt=True)
+    write(local / "apps" / APP / APP / "api.py", "x = 1\n")
+    tools_log.write_text("")
+
+    deploy(remote)
+
+    assert "clear-cache" not in tools_log.read_text()
+
+
+def test_html_referencing_missing_assets_fails_before_touching_the_server(benches, capsys):
+    local, remote = benches
+    app = local / "apps" / APP
+    write(app / "frontend" / "vite.config.js", VITE_CONFIG)
+    build_spa(app, "index-NEW.js")
+    (app / APP / "public" / "spa" / "assets" / "index-NEW.js").unlink()
+
+    with pytest.raises(typer.Exit):
+        deploy(remote, adopt=True)
+
+    assert "myapp/www/spa.html → /assets/myapp/spa/assets/index-NEW.js" in flat(capsys.readouterr().out)
+    assert not (remote / "apps" / APP / ".git").exists()
+
+
+def test_declared_build_output_must_exist(benches, capsys):
+    local, remote = benches
+    write(local / "apps" / APP / "pyproject.toml", '[tool.benchops]\nbuild_outputs = ["myapp/public/spa"]\n')
+
+    with pytest.raises(typer.Exit):
+        deploy(remote, adopt=True)
+
+    assert "Build output 'myapp/public/spa' does not exist" in flat(capsys.readouterr().out)
+
+
+def test_pre_local_hooks_get_placeholders_and_duplicate_build_is_flagged(benches, tools_log, capsys):
+    local, remote = benches
+
+    deploy(remote, adopt=True, site="s1", config={"pre_local_commands": ["bench --site {site} build --app {app}"]})
+
+    assert tools_log.read_text().splitlines()[0] == f"bench {local / 'apps'} --site s1 build --app {APP}"
+    assert "BenchOps now builds the app itself" in flat(capsys.readouterr().out)
