@@ -10,6 +10,7 @@ untracked files stay on their machine.
 import getpass
 import os
 import shutil
+import socket
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,12 @@ class StagedState:
     staged: list[tuple[str, str]] = field(default_factory=list)
     unstaged: list[tuple[str, str]] = field(default_factory=list)
     untracked: list[str] = field(default_factory=list)
+    commits_only: bool = False
+
+    @property
+    def shipped(self) -> list[tuple[str, str]]:
+        """The staged files this deploy ships (none for a commits-only sync)."""
+        return [] if self.commits_only else self.staged
 
 
 class LocalRepo:
@@ -92,6 +99,15 @@ class LocalRepo:
         except GitError:
             return getpass.getuser()
 
+    def identity(self) -> tuple[str, str]:
+        """(name, email) used as the owner of deployed drafts. Falls back to
+        the OS user at this host when git has no email configured."""
+        try:
+            email = self._git("config", "user.email").strip()
+        except GitError:
+            email = ""
+        return self.user_name(), email or f"{getpass.getuser()}@{socket.gethostname()}"
+
     def branch(self) -> str | None:
         try:
             return self._git("symbolic-ref", "--short", "-q", "HEAD").strip()
@@ -107,10 +123,13 @@ class LocalRepo:
                 env.setdefault(f"GIT_{role}_EMAIL", f"{user}@localhost")
         return env
 
-    def staged_state(self, deployer: str, build_outputs: list[str] = ()) -> StagedState:
+    def staged_state(self, deployer: str, build_outputs: list[str] = (), commits_only: bool = False) -> StagedState:
         """Capture HEAD plus the index as a staged commit, and list what is
         staged, unstaged and untracked. Build outputs are left out of the
-        lists: they ship from the build, not from git."""
+        lists: they ship from the build, not from git.
+
+        With `commits_only` (benchops sync) the staged commit carries HEAD's
+        own tree, so only commits ship; staged files stay on this machine."""
         if self._git("ls-files", "--unmerged").strip():
             raise GitError("The index has unresolved merge conflicts; resolve them before deploying.")
 
@@ -119,21 +138,38 @@ class LocalRepo:
 
         base = self._git("rev-parse", "HEAD").strip()
         branch = self.branch()
-        tree = self._git("write-tree").strip()
-        staged = [(s, p) for s, p in self._name_status(base, tree) if keep(p)]
+        tree = self._git("rev-parse", "HEAD^{tree}").strip() if commits_only else self._git("write-tree").strip()
+        staged = [(s, p) for s, p in self._name_status(base, self._git("write-tree").strip()) if keep(p)]
         unstaged = [(s, p) for s, p in self._name_status() if keep(p)]
         untracked = [
             p for p in self._git("ls-files", "--others", "--exclude-standard", "-z").split("\0") if p and keep(p)
         ]
 
-        message = f"benchops staged changes: {branch or '(detached)'}@{base[:10]}, {len(staged)} staged file(s)"
+        shipped = 0 if commits_only else len(staged)
+        message = f"benchops staged changes: {branch or '(detached)'}@{base[:10]}, {shipped} staged file(s)"
         message += f"\n\nDeployed by {deployer}."
         commit = self._git(
             "commit-tree", tree, "-p", base, "-m", message, env=self._identity_env(dict(os.environ))
         ).strip()
         return StagedState(
-            commit=commit, tree=tree, base=base, branch=branch, staged=staged, unstaged=unstaged, untracked=untracked
+            commit=commit, tree=tree, base=base, branch=branch, staged=staged, unstaged=unstaged,
+            untracked=untracked, commits_only=commits_only,
         )
+
+    def changed_paths(self, old: str, new: str) -> list[str] | None:
+        """Paths changed between two commits, or None if `old` is unknown here."""
+        if not self.has_commit(old):
+            return None
+        return [p for p in self._git("diff", "--name-only", "-z", old, new).split("\0") if p]
+
+    def blobs(self, commit: str) -> dict[str, str]:
+        """{path: blob sha} for every file in `commit`."""
+        entries = {}
+        for item in self._git("ls-tree", "-r", "-z", commit).split("\0"):
+            if item:
+                meta, path = item.split("\t", 1)
+                entries[path] = meta.split()[2]
+        return entries
 
     def commits_between(self, old: str, new: str) -> int | None:
         """How many commits `new` is ahead of `old`, if `old` is known here."""

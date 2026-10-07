@@ -2,8 +2,13 @@
 
 A deploy applies the developer's commits and what they staged with `git add`
 on top of the server's app, and touches nothing else there — people working
-directly on the server keep their uncommitted work, and `git status` on the
-server shows the deploy as "Changes to be committed" next to their changes.
+directly on the server keep their uncommitted work. Each staged file becomes
+the developer's *draft* on the server (recorded in its ledger, optionally
+with a task label) and stays staged there until a commit contains it.
+
+`benchops sync` runs the same pipeline with commits only: it moves the server
+to the developer's latest commit and marks drafts that commit now contains
+as committed. It builds only when the commits touch frontend source.
 
 Pipeline:
   1. local    pre-local hooks, staged state, build decision + build,
@@ -66,6 +71,8 @@ class LocalSide:
     bench: Path
     repo: LocalRepo
     deployer: str
+    name: str
+    email: str
     staged: StagedState
     output_specs: list[dict]
     outputs: list[str] = field(default_factory=list)  # build outputs to ship, if they changed
@@ -131,10 +138,12 @@ def required_steps(app: str, changes: list[str]) -> list[str]:
 
 
 def unstaged_frontend_changes(staged: StagedState, source_dirs: list[str]) -> list[str]:
-    """Unstaged or untracked files that `bench build` would compile even
-    though their source isn't part of the deploy."""
+    """Files that `bench build` would compile even though their source isn't
+    shipped: unstaged and untracked ones, plus staged ones for a sync."""
     paths = [p for _, p in staged.unstaged] + staged.untracked
-    return sorted(p for p in paths if any(p.startswith(d + "/") for d in source_dirs))
+    if staged.commits_only:
+        paths += [p for _, p in staged.staged]
+    return sorted(set(p for p in paths if any(p.startswith(d + "/") for d in source_dirs)))
 
 
 def _print_list(title: str, items: list, style: str, fmt=str) -> None:
@@ -164,6 +173,8 @@ class DeployCommand(BaseCommand):
         break_lock: bool = False,
         skip_build: bool = False,
         overwrite: bool = False,
+        label: str | None = None,
+        sync: bool = False,
     ) -> None:
         super().__init__(server_alias, app_name, site)
         self.yes = yes
@@ -171,6 +182,9 @@ class DeployCommand(BaseCommand):
         self.break_lock = break_lock
         self.skip_build = skip_build
         self.overwrite = overwrite
+        self.label = label
+        self.sync = sync
+        self.verb = "sync" if sync else "deploy"
 
     def _resolve_app_dir(self) -> Path:
         """Locate the local application directory."""
@@ -193,17 +207,24 @@ class DeployCommand(BaseCommand):
 
     # ------------------------------------------------------------------ local side
 
-    def _build_mode(self, local: LocalSide) -> str:
+    def _build_mode(self, local: LocalSide, committed: list[str] | None) -> str:
         """"build" (build, then ship), "existing" (ship the build on disk), or
-        "none" (ship no build outputs; the server keeps its current ones)."""
+        "none" (ship no build outputs; the server keeps its current ones).
+        `committed` is what a sync's commits change (None: unknown)."""
         if self.skip_build:
             console.print("[yellow]Skipping the local build (--skip-build); shipping the existing build.[/yellow]")
             return "existing"
-        risky = unstaged_frontend_changes(local.staged, frontend_source_dirs(local.app_dir, self.app_name))
+        source_dirs = frontend_source_dirs(local.app_dir, self.app_name)
+        if self.sync and committed is not None:
+            if not any(p.startswith(d + "/") for p in committed for d in source_dirs):
+                console.print("[dim]The commits don't touch frontend source; not building.[/dim]")
+                return "none"
+        risky = unstaged_frontend_changes(local.staged, source_dirs)
         if not risky:
             return "build"
+        what = "NOT committed" if self.sync else "NOT staged"
         _print_list(
-            "⚠ Frontend files with changes that are NOT staged (their source won't be deployed, "
+            f"⚠ Frontend files with changes that are {what} (their source won't be shipped, "
             "but the build compiles what is on disk)",
             risky,
             "bold yellow",
@@ -211,12 +232,15 @@ class DeployCommand(BaseCommand):
         if self.yes:
             console.print("[yellow]Building anyway (--yes); the shipped build includes these changes.[/yellow]")
             return "build"
-        if typer.confirm("Build anyway, including these unstaged changes?", default=True):
+        prompt = "Build anyway, including these uncommitted changes?" if self.sync else (
+            "Build anyway, including these unstaged changes?"
+        )
+        if typer.confirm(prompt, default=True):
             return "build"
         console.print("[yellow]Not building: the server keeps its current build outputs.[/yellow]")
         return "none"
 
-    def _prepare_local(self, server_config: dict) -> LocalSide:
+    def _prepare_local(self, server_config: dict, remote_head: str | None = None) -> LocalSide:
         app = self.app_name
         app_dir = self._resolve_app_dir()
         bench = resolve_bench_path(app_dir)
@@ -225,20 +249,24 @@ class DeployCommand(BaseCommand):
         self._run_hooks(local_runner, "pre_local_commands", "pre-local", server_config, str(app_dir.parent))
 
         build_outputs = load_build_outputs(app_dir, app)
-        deployer = f"{repo.user_name()}@{socket.gethostname()}"
+        name, email = repo.identity()
+        deployer = f"{name}@{socket.gethostname()}"
         local = LocalSide(
             app_dir=app_dir,
             bench=bench,
             repo=repo,
             deployer=deployer,
-            staged=repo.staged_state(deployer, build_outputs),
+            name=name,
+            email=email,
+            staged=repo.staged_state(deployer, build_outputs, commits_only=self.sync),
             output_specs=[
                 {"path": rel, "dir": (app_dir / rel).is_dir() or not (app_dir / rel).exists()}
                 for rel in build_outputs
             ],
         )
 
-        mode = self._build_mode(local)
+        committed = repo.changed_paths(remote_head, local.staged.base) if remote_head else None
+        mode = self._build_mode(local, committed)
         if mode == "build":
             if any(_BENCH_BUILD_RE.search(cmd) for cmd in server_config.get("pre_local_commands", [])):
                 console.print(
@@ -265,15 +293,23 @@ class DeployCommand(BaseCommand):
 
     def _render_plan(self, local: LocalSide, state: dict, preview: dict, warnings: list[str], shipped: list[str]) -> None:
         staged, repo = local.staged, local.repo
-        console.rule(f"Deploy plan: {self.app_name} → {self.server_alias}")
+        console.rule(f"{self.verb.capitalize()} plan: {self.app_name} → {self.server_alias}")
         console.print(f"Your side:  {staged.branch or '(detached)'} @ {staged.base[:10]}")
         behind = repo.commits_between(state["head"], staged.base)
         position = f" — {behind} commit(s) behind you" if behind else (" — same commit" if behind == 0 else "")
         console.print(f"Staging:    {state.get('branch') or '(detached)'} @ {state['head'][:10]}{position}")
-        console.print(f"Shipping:   {behind or 0} commit(s) + {len(staged.staged)} staged file(s)")
-        _print_list("Staged on your machine", staged.staged, "cyan", _change)
+        label = f"   label: {self.label}" if self.label else ""
+        console.print(f"Shipping:   {behind or 0} commit(s) + {len(staged.shipped)} staged file(s){label}")
+        _print_list("Staged on your machine", staged.shipped, "cyan", _change)
         not_shipped = [p for _, p in staged.unstaged] + staged.untracked
-        _print_list("Not shipped (not staged on your machine)", sorted(set(not_shipped)), "dim")
+        if staged.commits_only:
+            not_shipped += [p for _, p in staged.staged]
+        _print_list(
+            "Not shipped (not committed on your machine)" if staged.commits_only else
+            "Not shipped (not staged on your machine)",
+            sorted(set(not_shipped)),
+            "dim",
+        )
         _print_list("Files written on staging", preview["writes"], "cyan", _change)
 
         overlaps = preview["overlaps"]
@@ -287,12 +323,13 @@ class DeployCommand(BaseCommand):
             )
             console.print("[red]    Staging's versions are backed up first (refs/benchops/overwritten/…).[/red]")
             console.print()
-        _print_list(
-            "Previously staged on the server, not in this deploy (kept on disk, now unstaged)",
-            preview["restage"],
-            "yellow",
-        )
-        _print_list("Left untouched on staging (uncommitted work there)", preview["untouched"], "dim")
+        by_owner = lambda o: f"{o[0]}   ({o[1]})"
+        _print_list("Your earlier drafts, replaced", preview["replaced_own"], "cyan")
+        _print_list("Taking over drafts deployed by others", preview["takeover"], "yellow", by_owner)
+        _print_list("Drafts now committed (become clean on staging)", preview["absorbed"], "green", by_owner)
+        _print_list(f"Relabelled to {self.label}", preview["relabel"], "cyan")
+        _print_list("Other pending drafts on staging (untouched)", preview["other_drafts"], "dim", by_owner)
+        _print_list("Hand edits on staging (untouched)", preview["hand_edits"], "dim")
         if preview.get("branch_conflict"):
             warnings.append(
                 f"Branch '{staged.branch}' on the server points at {preview['branch_conflict'][:10]}, which is not "
@@ -318,7 +355,7 @@ class DeployCommand(BaseCommand):
                 )
             if not typer.confirm("Overwrite these files on staging with your version?", default=False):
                 raise DeployAborted("Nothing was changed on staging.")
-        elif not self.yes and not typer.confirm("Proceed with deploy?", default=False):
+        elif not self.yes and not typer.confirm(f"Proceed with {self.verb}?", default=False):
             raise DeployAborted("Cancelled.")
 
     # ------------------------------------------------------------------ run
@@ -330,9 +367,13 @@ class DeployCommand(BaseCommand):
         app = self.app_name
 
         try:
-            local = self._prepare_local(server_config)
+            remote_head = self._probe_remote_head(server_config) if self.sync else None
+            local = self._prepare_local(server_config, remote_head)
+        except RemoteAgentError as exc:
+            console.print(f"[red]{self.verb.capitalize()} failed: {self._describe_agent_error(exc)}[/red]")
+            raise typer.Exit(1)
         except (subprocess.CalledProcessError, BenchOpsConnectionError, FileNotFoundError, GitError, BuildError) as exc:
-            console.print(f"[red]Deployment failed: {exc}[/red]")
+            console.print(f"[red]{self.verb.capitalize()} failed: {exc}[/red]")
             raise typer.Exit(1)
         staged, repo = local.staged, local.repo
 
@@ -379,6 +420,13 @@ class DeployCommand(BaseCommand):
                     console.print("[yellow]Uploading deploy package...[/yellow]")
                     remote_runner.put(str(package), package_remote)
 
+                ownership = {
+                    "owner": local.email,
+                    "name": local.name,
+                    "deployer": local.deployer,
+                    "label": self.label,
+                    "staged_paths": [path for _, path in staged.shipped],
+                }
                 preview = agent.call(
                     "preview",
                     app=app,
@@ -386,11 +434,13 @@ class DeployCommand(BaseCommand):
                     package=package_remote,
                     branch=staged.branch,
                     build_outputs=local.output_specs,
+                    **ownership,
                 )
                 if preview["up_to_date"] and not shipped:
+                    what = "" if self.sync else " + your staged files"
                     console.print(
                         f"[green]'{app}' on '{self.server_alias}' is already up to date "
-                        f"({staged.branch or 'detached'} @ {staged.base[:10]} + your staged files).[/green]"
+                        f"({staged.branch or 'detached'} @ {staged.base[:10]}{what}).[/green]"
                     )
                     return
 
@@ -405,14 +455,16 @@ class DeployCommand(BaseCommand):
                     fingerprint=preview["fingerprint"],
                     branch=staged.branch,
                     overlaps=[path for path, _ in preview["overlaps"]],
-                    restage=preview["restage"],
                     build_outputs=local.output_specs,
+                    **ownership,
                     record={
                         "app": app,
+                        "mode": self.verb,
+                        "label": self.label,
                         "branch": staged.branch,
                         "deployer": local.deployer,
                         "deployed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                        "staged": [path for _, path in staged.staged],
+                        "staged": [path for _, path in staged.shipped],
                         "build_digest": local.digest if ship_build else record.get("build_digest"),
                     },
                 )
@@ -420,24 +472,29 @@ class DeployCommand(BaseCommand):
                     console.print(f"[cyan]Backed up on the server as {backup}.[/cyan]")
                 for warning in result.get("warnings", []):
                     console.print(f"[yellow]Warning: {warning}[/yellow]")
-                console.print(
-                    f"[green]Staging is now on {staged.branch or '(detached)'} @ {staged.base[:10]}; "
-                    "your staged files show there as 'Changes to be committed' (verified).[/green]"
-                )
+                where = f"Staging is now on {staged.branch or '(detached)'} @ {staged.base[:10]}"
+                if self.sync:
+                    console.print(f"[green]{where}; {result.get('absorbed', 0)} draft(s) marked committed (verified).[/green]")
+                else:
+                    console.print(
+                        f"[green]{where}; your staged files are your drafts there, staged until committed "
+                        "(verified).[/green]"
+                    )
                 if result.get("build_outputs"):
                     self._clear_remote_cache(remote_runner, bench_path)
 
                 self._run_hooks(remote_runner, "post_remote_commands", "post-remote", server_config, bench_path)
-                console.print(f"[green]Successfully deployed '{app}' to '{self.server_alias}'.[/green]")
+                done = "synced" if self.sync else "deployed"
+                console.print(f"[green]Successfully {done} '{app}' to '{self.server_alias}'.[/green]")
 
             except DeployAborted as exc:
-                console.print(f"[yellow]Deploy aborted: {exc}[/yellow]")
+                console.print(f"[yellow]{self.verb.capitalize()} aborted: {exc}[/yellow]")
                 raise typer.Exit(1)
             except RemoteAgentError as exc:
-                console.print(f"[red]Deployment failed: {self._describe_agent_error(exc)}[/red]")
+                console.print(f"[red]{self.verb.capitalize()} failed: {self._describe_agent_error(exc)}[/red]")
                 raise typer.Exit(1)
             except (subprocess.CalledProcessError, BenchOpsConnectionError, GitError, UnexpectedExit) as exc:
-                console.print(f"[red]Deployment failed: {exc}[/red]")
+                console.print(f"[red]{self.verb.capitalize()} failed: {exc}[/red]")
                 raise typer.Exit(1)
             finally:
                 # Only removes the lock if it carries our token, so a lock held
@@ -446,6 +503,13 @@ class DeployCommand(BaseCommand):
                     agent.call("release", app=app, token=token, package=package_remote)
                 except (RemoteAgentError, BenchOpsConnectionError) as exc:
                     console.print(f"[yellow]Warning: could not release the deploy lock: {exc}[/yellow]")
+
+    def _probe_remote_head(self, server_config: dict) -> str | None:
+        """The server's current commit, read-only and without the lock — so a
+        sync can tell whether its commits touch frontend source before
+        deciding to build."""
+        with self._get_remote_runner(server_config) as runner:
+            return RemoteAgent(runner, server_config["bench_path"]).call("status", app=self.app_name)["head"]
 
     def _clear_remote_cache(self, runner, bench_path: str) -> None:
         """New build outputs change asset hashes; clear Frappe's caches on

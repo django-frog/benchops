@@ -22,8 +22,15 @@ index and whose parent is their HEAD. On the server:
   * HEAD moves to the developer's commit, on their branch;
   * every other file is left exactly as it is, so work done directly on the
     server stays on disk and stays visible in `git status`;
+  * every uncommitted file a deploy put on the server is a *draft*, recorded
+    in .git/benchops/ledger.json with its owner (git email), label, content
+    and date. Drafts stay staged until committed: when a later deploy or
+    `benchops sync` brings a commit containing exactly a draft's content,
+    the draft is *absorbed* (the file is clean again);
   * a path in the deploy set that has different uncommitted content on the
-    server is an *overlap*: it is reported up front, backed up under
+    server is an *overlap* — unless it is the deployer's own untouched
+    draft. Overlaps are reported up front (another developer's draft, or a
+    hand edit made on the server), backed up under
     refs/benchops/overwritten/, and only then overwritten;
   * build outputs (public/dist, SPA builds) are not part of the overlay:
     when shipped, they replace the server's copy wholesale.
@@ -267,6 +274,60 @@ def fingerprint(app_dir, paths):
     return digest.hexdigest()
 
 
+# --------------------------------------------------------------------------- ledger
+
+
+def ledger_path(app_dir):
+    return os.path.join(state_dir(app_dir), "ledger.json")
+
+
+def load_ledger(app_dir):
+    """{path: {owner, name, deployer, label, blob, deployed_at}}. A server last
+    deployed by 0.14/0.15 has no ledger yet: its last deploy's staged files
+    become drafts of that deployer."""
+    ledger = read_json(ledger_path(app_dir))
+    if ledger is not None:
+        return ledger
+    record = read_json(os.path.join(state_dir(app_dir), "deploy.json")) or {}
+    commit = record.get("staged_commit")
+    if not (record.get("staged") and commit and rev(app_dir, commit)):
+        return {}
+    blobs = tree_entries(app_dir, commit)
+    return {
+        path: {
+            "owner": record.get("deployer"),
+            "name": record.get("deployer"),
+            "deployer": record.get("deployer"),
+            "label": record.get("label"),
+            "blob": blobs.get(path),
+            "deployed_at": record.get("deployed_at"),
+        }
+        for path in record["staged"]
+    }
+
+
+def is_mine(entry, args):
+    return entry.get("owner") in (args.get("owner"), args.get("deployer"))
+
+
+def describe_draft(entry):
+    label = " [%s]" % entry["label"] if entry.get("label") else ""
+    return "%s's deployed draft%s" % (entry.get("name") or entry.get("owner"), label)
+
+
+def stage_drafts(app_dir, ledger):
+    """Keep every draft that is still exactly as deployed staged, so "Changes
+    to be committed" on the server lists all pending deploys. Drafts edited on
+    the server since are left alone (they read as hand edits)."""
+    on_disk = worktree_hashes(app_dir, list(ledger))
+    present = [p for p, e in ledger.items() if e["blob"] is not None and on_disk[p] == e["blob"]]
+    deleted = [p for p, e in ledger.items() if e["blob"] is None and on_disk[p] is None]
+    for group in chunks(present):
+        git(app_dir, "add", "-f", "--", *group)
+    for group in chunks(deleted):
+        git(app_dir, "rm", "-q", "--cached", "--ignore-unmatch", "--", *group)
+
+
 # --------------------------------------------------------------------------- commands
 
 
@@ -312,11 +373,86 @@ def cmd_inspect(args):
     }
 
 
+def plan(app_dir, args):
+    """Classify everything a deploy (or sync) would do. Shared by preview and
+    apply, so what the developer confirmed is exactly what gets applied."""
+    build_outputs = args.get("build_outputs", [])
+    staged_commit = rev(app_dir, INCOMING_REF)
+    new_head = rev(app_dir, INCOMING_REF + "^")
+    head = rev(app_dir, "HEAD")
+    staged_paths = set(args.get("staged_paths", []))
+
+    code_paths, output_paths = deploy_set(app_dir, head, staged_commit, build_outputs)
+    incoming_blobs = tree_entries(app_dir, staged_commit)
+    new_head_blobs = tree_entries(app_dir, new_head)
+    dirty = {p: c for p, c in dirty_paths(app_dir).items() if not under_outputs(p, build_outputs)}
+    ledger = load_ledger(app_dir)
+    on_disk = worktree_hashes(app_dir, sorted(set(p for _, p in code_paths) | set(ledger)))
+    index_blobs = {}
+    for item in git_z(app_dir, "ls-files", "-s", "-z"):
+        meta_part, path = item.split("\t", 1)
+        index_blobs[path] = meta_part.split()[1]
+
+    def intact(path):
+        entry = ledger.get(path)
+        return entry is not None and on_disk.get(path) == entry["blob"]
+
+    overlaps, replaced_own, pending = [], [], []
+    for _, path in code_paths:
+        want = incoming_blobs.get(path)
+        if on_disk[path] != want or index_blobs.get(path) != want:
+            pending.append(path)
+        if path in dirty and on_disk[path] != want:
+            if intact(path) and is_mine(ledger[path], args):
+                replaced_own.append(path)
+            elif intact(path):
+                overlaps.append([path, describe_draft(ledger[path])])
+            else:
+                overlaps.append([path, describe(dirty[path])])
+
+    code_set = set(p for _, p in code_paths)
+    overlapping = set(p for p, _ in overlaps)
+    takeover = sorted(
+        p for p in staged_paths if p in ledger and not is_mine(ledger[p], args) and p not in overlapping
+    )
+    # Drafts the incoming commit now contains exactly: they become clean.
+    absorbed = sorted(
+        p for p, e in ledger.items()
+        if p not in staged_paths and new_head_blobs.get(p) == e["blob"] and (p in code_set or intact(p))
+    )
+    relabel = sorted(
+        p for p in staged_paths
+        if args.get("label") and ledger.get(p, {}).get("label") != args["label"]
+    )
+    other_drafts = sorted(p for p in ledger if p not in code_set and p not in absorbed and intact(p))
+    hand_edits = sorted(p for p in dirty if p not in code_set and not intact(p))
+    outputs_pending = [p for _, p in output_paths if index_blobs.get(p) != incoming_blobs.get(p)]
+
+    return {
+        "head": head,
+        "new_head": new_head,
+        "staged_commit": staged_commit,
+        "code_paths": code_paths,
+        "output_paths": output_paths,
+        "incoming_blobs": incoming_blobs,
+        "new_head_blobs": new_head_blobs,
+        "ledger": ledger,
+        "overlaps": overlaps,
+        "replaced_own": sorted(replaced_own),
+        "takeover": takeover,
+        "absorbed": absorbed,
+        "relabel": relabel,
+        "other_drafts": other_drafts,
+        "hand_edits": hand_edits,
+        "up_to_date": head == new_head and not pending and not outputs_pending and not takeover
+        and not absorbed and not relabel,
+    }
+
+
 def cmd_preview(args):
     app = args["app"]
     app_dir = os.path.join("apps", app)
     check_lock(app_dir, args["token"])
-    build_outputs = args.get("build_outputs", [])
 
     incoming = os.path.join(state_dir(app_dir), "incoming")
     shutil.rmtree(incoming, ignore_errors=True)
@@ -327,65 +463,36 @@ def cmd_preview(args):
         else:
             tar.extractall(incoming)
     meta = read_json(os.path.join(incoming, "meta.json"))
-
     bundle = os.path.abspath(os.path.join(incoming, "staged.bundle"))
     git(app_dir, "bundle", "verify", bundle)
     git(app_dir, "fetch", "-q", "--no-tags", bundle, "+%s:%s" % (meta["bundle_ref"], INCOMING_REF))
-    staged_commit = rev(app_dir, INCOMING_REF)
-    new_head = rev(app_dir, INCOMING_REF + "^")
-    head = rev(app_dir, "HEAD")
 
-    code_paths, output_paths = deploy_set(app_dir, head, staged_commit, build_outputs)
-    incoming_blobs = tree_entries(app_dir, staged_commit)
-    dirty = {p: c for p, c in dirty_paths(app_dir).items() if not under_outputs(p, build_outputs)}
-    on_disk = worktree_hashes(app_dir, [p for _, p in code_paths])
-    index_blobs = {}
-    for item in git_z(app_dir, "ls-files", "-s", "-z"):
-        meta_part, path = item.split("\t", 1)
-        index_blobs[path] = meta_part.split()[1]
+    result = plan(app_dir, args)
+    ledger = result["ledger"]
 
-    previous = (read_json(os.path.join(state_dir(app_dir), "deploy.json")) or {})
-    previous_staged = set(previous.get("staged", []))
-
-    overlaps, pending = [], []
-    for _, path in code_paths:
-        want = incoming_blobs.get(path)
-        if on_disk[path] != want or index_blobs.get(path) != want:
-            pending.append(path)
-        if path in dirty and on_disk[path] != want:
-            reason = describe(dirty[path])
-            if path in previous_staged:
-                reason += " (from %s's deploy)" % previous.get("deployer", "an earlier")
-            overlaps.append([path, reason])
-
-    outputs_pending = [p for _, p in output_paths if index_blobs.get(p) != incoming_blobs.get(p)]
-    code_set = set(p for _, p in code_paths)
-    # Staged on the server but not part of this deploy: the previous deploy's
-    # staged files. They stay on disk and become unstaged, so "Changes to be
-    # committed" shows exactly this deploy.
-    restage = [
-        p for p in git_z(app_dir, "diff", "--cached", "--name-only", "-z", head)
-        if p not in code_set and not under_outputs(p, build_outputs)
-    ]
-    untouched = sorted(p for p in dirty if p not in code_set)
+    def owner_of(paths):
+        return [[p, describe_draft(ledger[p])] for p in paths]
 
     branch_conflict = None
     if args.get("branch"):
         existing = rev(app_dir, "refs/heads/" + args["branch"])
-        if existing and existing != new_head and not is_ancestor(app_dir, existing, new_head):
+        if existing and existing != result["new_head"] and not is_ancestor(app_dir, existing, result["new_head"]):
             branch_conflict = existing
 
+    code_set = set(p for _, p in result["code_paths"])
     return {
-        "new_head": new_head,
-        "staged_commit": staged_commit,
-        "head_is_ancestor": is_ancestor(app_dir, head, new_head),
-        "writes": [[s, p] for s, p in code_paths if p in pending],
-        "changes": [p for _, p in code_paths] + [p for _, p in output_paths],
-        "overlaps": overlaps,
-        "restage": restage,
-        "untouched": untouched,
+        "new_head": result["new_head"],
+        "writes": [[s, p] for s, p in result["code_paths"]],
+        "changes": [p for _, p in result["code_paths"]] + [p for _, p in result["output_paths"]],
+        "overlaps": result["overlaps"],
+        "replaced_own": result["replaced_own"],
+        "takeover": owner_of(result["takeover"]),
+        "absorbed": owner_of(result["absorbed"]),
+        "relabel": result["relabel"],
+        "other_drafts": owner_of(result["other_drafts"]),
+        "hand_edits": result["hand_edits"],
         "branch_conflict": branch_conflict,
-        "up_to_date": head == new_head and not pending and not outputs_pending and not restage,
+        "up_to_date": result["up_to_date"],
         "fingerprint": fingerprint(app_dir, sorted(code_set)),
     }
 
@@ -462,12 +569,10 @@ def cmd_apply(args):
     app = args["app"]
     app_dir = os.path.join("apps", app)
     check_lock(app_dir, args["token"])
-    build_outputs = args.get("build_outputs", [])
-    staged_commit = rev(app_dir, INCOMING_REF)
-    new_head = rev(app_dir, INCOMING_REF + "^")
-    head = rev(app_dir, "HEAD")
-
-    code_paths, output_paths = deploy_set(app_dir, head, staged_commit, build_outputs)
+    result_plan = plan(app_dir, args)
+    head, new_head = result_plan["head"], result_plan["new_head"]
+    staged_commit = result_plan["staged_commit"]
+    code_paths, output_paths = result_plan["code_paths"], result_plan["output_paths"]
     if fingerprint(app_dir, sorted(p for _, p in code_paths)) != args["fingerprint"]:
         raise AgentError("staging_changed")
 
@@ -480,7 +585,7 @@ def cmd_apply(args):
         git(app_dir, "update-ref", ref, head)
         result["backups"].append(ref)
 
-    incoming_blobs = tree_entries(app_dir, staged_commit)
+    incoming_blobs = result_plan["incoming_blobs"]
     writes = [p for _, p in code_paths if p in incoming_blobs]
     deletes = [p for _, p in code_paths if p not in incoming_blobs]
     for group in chunks(writes):
@@ -493,8 +598,6 @@ def cmd_apply(args):
     # come from the shipped build below.
     for group in chunks(p for _, p in output_paths):
         git(app_dir, "reset", "-q", staged_commit, "--", *group)
-    for group in chunks(args.get("restage", [])):
-        git(app_dir, "reset", "-q", new_head, "--", *group)
 
     branch = args.get("branch")
     if branch:
@@ -509,6 +612,36 @@ def cmd_apply(args):
     else:
         git(app_dir, "update-ref", "--no-deref", "HEAD", new_head)
 
+    # Ledger: this deploy's staged files become the deployer's drafts; other
+    # files it wrote are committed content; drafts a commit now contains are
+    # absorbed. Everything else (other developers' drafts) is kept.
+    ledger = result_plan["ledger"]
+    staged_paths = set(args.get("staged_paths", []))
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    for _, path in code_paths:
+        if path in staged_paths:
+            previous = ledger.get(path) or {}
+            ledger[path] = {
+                "owner": args.get("owner"),
+                "name": args.get("name"),
+                "deployer": args.get("deployer"),
+                "label": args.get("label") or previous.get("label"),
+                "blob": incoming_blobs.get(path),
+                "deployed_at": now,
+            }
+        else:
+            ledger.pop(path, None)
+    on_disk = worktree_hashes(app_dir, list(ledger))
+    new_head_blobs = result_plan["new_head_blobs"]
+    absorbed = [p for p, e in ledger.items() if new_head_blobs.get(p) == e["blob"] and on_disk[p] == e["blob"]]
+    for path in absorbed:
+        del ledger[path]
+    for group in chunks(absorbed):
+        git(app_dir, "reset", "-q", new_head, "--", *group)
+    stage_drafts(app_dir, ledger)
+    write_json(ledger_path(app_dir), ledger)
+    result["absorbed"] = len(set(absorbed) | set(result_plan["absorbed"]))
+
     incoming = os.path.join(state_dir(app_dir), "incoming")
     meta = read_json(os.path.join(incoming, "meta.json"), {})
     shipped = meta.get("build_outputs", [])
@@ -520,7 +653,7 @@ def cmd_apply(args):
     result["build_outputs"] = shipped
 
     # Verify: HEAD is the developer's commit, and every deployed path matches
-    # their staged version on disk and in the index.
+    # the incoming version on disk and in the index.
     if rev(app_dir, "HEAD") != new_head:
         raise AgentError("verification failed: HEAD is not %s" % new_head)
     paths = [p for _, p in code_paths]
@@ -528,7 +661,7 @@ def cmd_apply(args):
         if git_z(app_dir, "diff", "--name-only", "-z", staged_commit, "--", *group) or git_z(
             app_dir, "diff", "--cached", "--name-only", "-z", staged_commit, "--", *group
         ):
-            raise AgentError("verification failed: deployed files do not match the staged versions")
+            raise AgentError("verification failed: deployed files do not match the incoming versions")
 
     git(app_dir, "update-ref", DEPLOYED_REF, staged_commit)
     git(app_dir, "update-ref", "-d", INCOMING_REF, check=False)
@@ -540,7 +673,7 @@ def cmd_apply(args):
 
 
 def cmd_status(args):
-    """Read-only: what the server runs, who deployed it, what's changed since."""
+    """Read-only: what the server runs, who deployed what, what's changed."""
     app_dir = os.path.join("apps", args["app"])
     if not os.path.isdir(os.path.join(app_dir, ".git")):
         raise AgentError("not_repo")
@@ -550,13 +683,13 @@ def cmd_status(args):
     result["lock"] = read_json(os.path.join(app_dir, ".git", "benchops", "lock.json"))
     result["subject"] = git(app_dir, "log", "-1", "--format=%s", "HEAD").strip() if head else None
 
-    # Deployed files that someone changed on the server since the deploy.
-    drifted = []
-    if record and record.get("staged_commit") and rev(app_dir, record["staged_commit"]):
-        deployed = record.get("staged", [])
-        for group in chunks(deployed):
-            drifted += git_z(app_dir, "diff", "--name-only", "-z", record["staged_commit"], "--", *group)
-    result["drifted"] = sorted(set(drifted))
+    ledger = load_ledger(app_dir) if head else {}
+    on_disk = worktree_hashes(app_dir, list(ledger))
+    result["drafts"] = [
+        dict(entry, path=path, edited=on_disk[path] != entry["blob"]) for path, entry in sorted(ledger.items())
+    ]
+    intact = set(d["path"] for d in result["drafts"] if not d["edited"])
+    result["hand_edits"] = sorted(p for p in dirty_paths(app_dir) if p not in intact)
     return result
 
 

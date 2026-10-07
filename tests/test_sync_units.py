@@ -312,6 +312,7 @@ def test_cli_deploy_passes_flags(deploy_kwargs):
         "force": True,
         "break_lock": True,
         "skip_build": True,
+        "label": None,
         "executed": True,
     }
 

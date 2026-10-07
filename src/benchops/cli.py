@@ -327,6 +327,9 @@ def deploy(
     skip_build: bool = typer.Option(
         False, "--skip-build", help="Don't run 'yarn install' and 'bench build' locally; ship the existing build."
     ),
+    label: str | None = typer.Option(
+        None, "--label", help="Tag the deployed drafts, e.g. a task ID (TASK-142); shown by 'benchops status'."
+    ),
 ) -> None:
     """Deploy your commits and staged changes (git add) to a remote server."""
     command = DeployCommand(
@@ -338,6 +341,39 @@ def deploy(
         force=force,
         break_lock=break_lock,
         skip_build=skip_build,
+        label=label,
+    )
+    command.execute()
+
+
+@app.command("sync")
+def sync(
+    app_name: str = typer.Argument(..., help="Name of the local Frappe app directory to sync."),
+    server_alias: str = typer.Argument(..., help="Alias of the target server."),
+    site: str | None = typer.Option(None, help="Specific site to target for remote commands (e.g., test-16.akwad.qa)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Apply the sync plan without asking for confirmation."),
+    overwrite: bool = typer.Option(
+        False, "--overwrite", help="Allow replacing files that have different uncommitted changes on the server."
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Sync even if the server is on a commit that is not in your history."
+    ),
+    break_lock: bool = typer.Option(False, "--break-lock", help="Take over a stale deploy lock left on the server."),
+    skip_build: bool = typer.Option(
+        False, "--skip-build", help="Don't build locally, even if the commits touch frontend source."
+    ),
+) -> None:
+    """Bring the server up to your latest commits (no staged files); deployed drafts those commits contain become committed."""
+    command = DeployCommand(
+        server_alias=server_alias,
+        app_name=app_name,
+        site=site,
+        yes=yes,
+        overwrite=overwrite,
+        force=force,
+        break_lock=break_lock,
+        skip_build=skip_build,
+        sync=True,
     )
     command.execute()
 

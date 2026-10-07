@@ -112,6 +112,10 @@ def record(remote):
     return json.loads((remote / "apps" / APP / ".git" / "benchops" / "deploy.json").read_text())
 
 
+def ledger(remote):
+    return json.loads((remote / "apps" / APP / ".git" / "benchops" / "ledger.json").read_text())
+
+
 def lock_file(remote):
     return remote / "apps" / APP / ".git" / "benchops" / "lock.json"
 
@@ -178,7 +182,7 @@ def test_staged_deletion_removes_the_file_on_staging(benches):
     assert status(rapp) == [f"D  {APP}/sales/doctype/visit/visit.json"]
 
 
-def test_previous_deploys_staged_files_stay_on_disk_as_unstaged(benches):
+def test_earlier_drafts_stay_staged_until_committed(benches):
     local, remote = benches
     app, rapp = local / "apps" / APP, remote / "apps" / APP
     write(app / APP / "hooks.py", "first deploy\n")
@@ -191,7 +195,8 @@ def test_previous_deploys_staged_files_stay_on_disk_as_unstaged(benches):
     deploy(remote)
 
     assert (rapp / APP / "hooks.py").read_text() == "first deploy\n"
-    assert sorted(status(rapp)) == sorted([f"A  {APP}/api.py", f" M {APP}/hooks.py"])
+    assert sorted(status(rapp)) == sorted([f"A  {APP}/api.py", f"M  {APP}/hooks.py"])
+    assert sorted(ledger(remote)) == [f"{APP}/api.py", f"{APP}/hooks.py"]
 
 
 def test_two_developers_deploys_coexist(benches, tmp_path, monkeypatch):
@@ -210,8 +215,10 @@ def test_two_developers_deploys_coexist(benches, tmp_path, monkeypatch):
 
     assert (rapp / APP / "whatsapp.py").read_text() == "by dev\n"
     assert (rapp / APP / "service.py").read_text() == "by ali\n"
-    assert sorted(status(rapp)) == sorted([f"A  {APP}/service.py", f"?? {APP}/whatsapp.py"])
+    assert sorted(status(rapp)) == sorted([f"A  {APP}/service.py", f"A  {APP}/whatsapp.py"])
     assert record(remote)["deployer"].startswith("Ali@")
+    owners = {path: entry["owner"] for path, entry in ledger(remote).items()}
+    assert owners == {f"{APP}/whatsapp.py": "dev@example.com", f"{APP}/service.py": "ali@example.com"}
 
 
 # --------------------------------------------------------------------------- overlaps
@@ -688,26 +695,336 @@ def test_pre_local_build_hook_is_flagged_as_duplicate(benches, tools_log, capsys
 # --------------------------------------------------------------------------- status
 
 
-def test_status_shows_deploy_and_work_on_staging(benches, capsys):
+def run_status(remote, files=True):
+    command = StatusCommand(server_alias="staging", app_name=APP, files=files)
+    command._get_server_config = lambda: {"bench_path": str(remote)}
+    command._get_remote_runner = lambda server_config: LocalRunner()
+    command.execute()
+
+
+def test_status_groups_drafts_by_label_and_developer(benches, tmp_path, monkeypatch, capsys):
     local, remote = benches
     app, rapp = local / "apps" / APP, remote / "apps" / APP
     write(app / APP / "hooks.py", "mine\n")
     write(app / APP / "api.py", "x = 1\n")
     git(app, "add", "-A")
+    deploy(remote, label="TASK-142")
+    bench_b = tmp_path / "ali"
+    app_b = make_local_bench(bench_b, user="Ali", clone_from=app)
+    write(app_b / APP / "service.py", "by ali\n")
+    git(app_b, "add", "-A")
+    monkeypatch.chdir(bench_b)
     deploy(remote)
-    write(rapp / APP / "hooks.py", "changed on staging after the deploy\n")
+    monkeypatch.chdir(local)
+    # Ali's draft is old; one of Dev's drafts was edited on staging; plus a hand edit.
+    entries = ledger(remote)
+    entries[f"{APP}/service.py"]["deployed_at"] = "2026-01-01T09:00:00+0000"
+    write(rapp / ".git" / "benchops" / "ledger.json", json.dumps(entries))
+    write(rapp / APP / "api.py", "edited on staging\n")
     write(rapp / APP / "scratch.py", "")
     capsys.readouterr()
 
-    command = StatusCommand(server_alias="staging", app_name=APP, files=True)
-    command._get_server_config = lambda: {"bench_path": str(remote)}
-    command._get_remote_runner = lambda server_config: LocalRunner()
-    command.execute()
+    run_status(remote)
 
     out = flat(capsys.readouterr().out)
     assert "On develop @" in out
-    assert "Last deploy Dev@" in out and "2 staged file(s)" in out
-    assert f"Changes to be committed (staged) 2 A {APP}/api.py M {APP}/hooks.py" in out
-    assert f"Changes not staged 1 M {APP}/hooks.py" in out
-    assert f"Untracked files 1 {APP}/scratch.py" in out
-    assert f"Deployed files changed since deploy 1 {APP}/hooks.py" in out
+    assert "Last deploy Ali@" in out
+    assert "Pending drafts (deployed, not committed yet):" in out
+    assert f"TASK-142 Dev 2 file(s) today {APP}/api.py (edited on staging since) {APP}/hooks.py" in out
+    assert f"(no label) Ali 1 file(s)" in out and "⚠ stale" in out
+    assert "Drafts edited on staging since 1 file(s)" in out
+    assert f"Hand edits on staging 2 file(s) {APP}/api.py {APP}/scratch.py" in out
+
+
+def test_status_points_out_drafts_already_committed_locally(benches, capsys):
+    local, remote = benches
+    app = local / "apps" / APP
+    write(app / APP / "hooks.py", "mine\n")
+    git(app, "add", "-A")
+    deploy(remote)
+    git(app, "commit", "-q", "-m", "commit the draft")
+    capsys.readouterr()
+
+    run_status(remote)
+
+    assert f"Committed on your machine 1 file(s) — run 'benchops sync' {APP}/hooks.py" in flat(capsys.readouterr().out)
+
+
+# --------------------------------------------------------------------------- ledger: drafts, labels, sync
+
+
+def as_ali(tmp_path, monkeypatch, app):
+    bench_b = tmp_path / "ali"
+    app_b = make_local_bench(bench_b, user="Ali", clone_from=app)
+    monkeypatch.chdir(bench_b)
+    return app_b
+
+
+def test_replacing_your_own_draft_is_not_an_overlap(benches, monkeypatch, capsys):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / APP / "hooks.py", "draft 1\n")
+    git(app, "add", "-A")
+    deploy(remote)
+    write(app / APP / "hooks.py", "draft 2\n")
+    git(app, "add", "-A")
+    prompts = []
+    monkeypatch.setattr(typer, "confirm", lambda message, **k: prompts.append(message) or True)
+    capsys.readouterr()
+
+    deploy(remote, yes=False)
+
+    assert prompts == ["Proceed with deploy?"]
+    assert (rapp / APP / "hooks.py").read_text() == "draft 2\n"
+    assert "Your earlier drafts, replaced: 1" in flat(capsys.readouterr().out)
+
+
+def test_replacing_another_developers_draft_names_them(benches, tmp_path, monkeypatch, capsys):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    app_b = as_ali(tmp_path, monkeypatch, app)
+    write(app_b / APP / "hooks.py", "ali's draft\n")
+    git(app_b, "add", "-A")
+    deploy(remote, label="TASK-150")
+    monkeypatch.chdir(local)
+    write(app / APP / "hooks.py", "mine\n")
+    git(app, "add", "-A")
+    capsys.readouterr()
+
+    with pytest.raises(typer.Exit):
+        deploy(remote)
+    out = flat(capsys.readouterr().out)
+    assert f"will be replaced by your version: 1 {APP}/hooks.py (Ali's deployed draft [TASK-150])" in out
+    assert "Taking over" not in out  # listed once, as an overlap
+    assert (rapp / APP / "hooks.py").read_text() == "ali's draft\n"
+
+    deploy(remote, overwrite=True)
+    assert (rapp / APP / "hooks.py").read_text() == "mine\n"
+    assert ledger(remote)[f"{APP}/hooks.py"]["owner"] == "dev@example.com"
+    assert ledger(remote)[f"{APP}/hooks.py"]["label"] == "TASK-150"  # the task label carries over
+
+
+def test_own_draft_edited_on_staging_is_a_hand_edit_again(benches):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / APP / "hooks.py", "draft 1\n")
+    git(app, "add", "-A")
+    deploy(remote)
+    write(rapp / APP / "hooks.py", "edited in Desk after the deploy\n")
+    write(app / APP / "hooks.py", "draft 2\n")
+    git(app, "add", "-A")
+
+    with pytest.raises(typer.Exit):  # an overlap: --yes without --overwrite
+        deploy(remote)
+    assert (rapp / APP / "hooks.py").read_text() == "edited in Desk after the deploy\n"
+
+
+def test_labels_are_kept_on_redeploy_and_can_be_changed(benches):
+    local, remote = benches
+    app = local / "apps" / APP
+    write(app / APP / "hooks.py", "v1\n")
+    git(app, "add", "-A")
+    deploy(remote, label="TASK-1")
+    write(app / APP / "hooks.py", "v2\n")
+    git(app, "add", "-A")
+
+    deploy(remote)
+    assert ledger(remote)[f"{APP}/hooks.py"]["label"] == "TASK-1"
+
+    deploy(remote, label="TASK-2")
+    assert ledger(remote)[f"{APP}/hooks.py"]["label"] == "TASK-2"
+    assert record(remote)["label"] == "TASK-2"
+
+
+def test_deploying_exactly_someone_elses_draft_takes_it_over(benches, tmp_path, monkeypatch, capsys):
+    local, remote = benches
+    app = local / "apps" / APP
+    app_b = as_ali(tmp_path, monkeypatch, app)
+    write(app_b / APP / "service.py", "shared\n")
+    git(app_b, "add", "-A")
+    deploy(remote, label="TASK-7")
+    monkeypatch.chdir(local)
+    write(app / APP / "service.py", "shared\n")
+    git(app, "add", "-A")
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", "-A")
+    capsys.readouterr()
+
+    deploy(remote)
+
+    assert f"Taking over drafts deployed by others: 1 {APP}/service.py (Ali's deployed draft [TASK-7])" in flat(
+        capsys.readouterr().out
+    )
+    assert ledger(remote)[f"{APP}/service.py"]["owner"] == "dev@example.com"
+    assert ledger(remote)[f"{APP}/service.py"]["label"] == "TASK-7"
+
+
+def test_sync_marks_committed_drafts_clean(benches, capsys):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / APP / "hooks.py", "approved\n")
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", "-A")
+    deploy(remote, label="TASK-142")
+    git(app, "commit", "-q", "-m", "TASK-142")
+    capsys.readouterr()
+
+    deploy(remote, sync=True)
+
+    out = flat(capsys.readouterr().out)
+    assert "Drafts now committed (become clean on staging): 2" in out
+    assert "2 draft(s) marked committed" in out
+    assert git(rapp, "rev-parse", "HEAD") == git(app, "rev-parse", "HEAD")
+    assert status(rapp) == []
+    assert ledger(remote) == {}
+    assert record(remote)["mode"] == "sync"
+
+
+def test_sync_replaces_your_own_draft_with_the_committed_version(benches, monkeypatch):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / APP / "hooks.py", "draft reviewed by business\n")
+    git(app, "add", "-A")
+    deploy(remote)
+    write(app / APP / "hooks.py", "draft reviewed by business, tidied up\n")
+    git(app, "commit", "-qam", "tidy and commit")
+    prompts = []
+    monkeypatch.setattr(typer, "confirm", lambda message, **k: prompts.append(message) or True)
+
+    deploy(remote, sync=True, yes=False)
+
+    assert prompts == ["Proceed with sync?"]
+    assert (rapp / APP / "hooks.py").read_text() == "draft reviewed by business, tidied up\n"
+    assert status(rapp) == []
+    assert ledger(remote) == {}
+
+
+def test_sync_ships_no_staged_files_and_keeps_other_drafts(benches, tmp_path, monkeypatch):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / APP / "a.py", "a\n")
+    write(app / APP / "b.py", "b\n")
+    git(app, "add", "-A")
+    deploy(remote)
+    git(app, "commit", "-q", "-m", "a only", "--", f"{APP}/a.py")
+    write(app / APP / "c.py", "staged, not committed\n")
+    git(app, "add", f"{APP}/c.py")
+
+    deploy(remote, sync=True)
+
+    assert not (rapp / APP / "c.py").exists()
+    assert status(rapp) == [f"A  {APP}/b.py"]
+    assert sorted(ledger(remote)) == [f"{APP}/b.py"]
+
+
+def test_sync_that_overwrites_someone_elses_draft_asks_first(benches, tmp_path, monkeypatch):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    app_b = as_ali(tmp_path, monkeypatch, app)
+    write(app_b / APP / "hooks.py", "ali's draft\n")
+    git(app_b, "add", "-A")
+    deploy(remote)
+    monkeypatch.chdir(local)
+    write(app / APP / "hooks.py", "committed by dev\n")
+    git(app, "commit", "-qam", "dev's change")
+
+    with pytest.raises(typer.Exit):
+        deploy(remote, sync=True)
+    assert (rapp / APP / "hooks.py").read_text() == "ali's draft\n"
+
+
+def test_sync_without_new_commits_is_a_no_op(benches, capsys):
+    local, remote = benches
+    app = local / "apps" / APP
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", "-A")
+    git(app, "commit", "-q", "-m", "api")
+    deploy(remote, sync=True)
+    capsys.readouterr()
+
+    deploy(remote, sync=True)
+
+    assert "already up to date" in capsys.readouterr().out
+
+
+def test_staged_deletion_draft_is_absorbed_when_committed(benches):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    git(app, "rm", "-q", f"{APP}/sales/doctype/visit/visit.json")
+    deploy(remote)
+    assert f"{APP}/sales/doctype/visit/visit.json" in ledger(remote)
+    git(app, "commit", "-q", "-m", "drop visit")
+
+    deploy(remote, sync=True)
+
+    assert status(rapp) == []
+    assert ledger(remote) == {}
+
+
+def test_sync_only_builds_when_commits_touch_frontend_source(benches, tools_log):
+    local, remote = benches
+    app = local / "apps" / APP
+    deploy(remote, skip_build=True)
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", "-A")
+    git(app, "commit", "-q", "-m", "backend only")
+    tools_log.write_text("")
+
+    deploy(remote, sync=True)
+    assert "build --app" not in tools_log.read_text()
+
+    write(app / APP / "public" / "js" / "form.js", "frontend")
+    git(app, "add", "-A")
+    git(app, "commit", "-q", "-m", "frontend change")
+
+    deploy(remote, sync=True)
+    assert f"bench {local} build --app {APP}" in tools_log.read_text()
+
+
+def test_ledger_is_bootstrapped_from_a_0_14_deploy_record(benches, capsys):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / APP / "hooks.py", "deployed by 0.14\n")
+    git(app, "add", "-A")
+    deploy(remote)
+    (rapp / ".git" / "benchops" / "ledger.json").unlink()  # what a 0.14 server looks like
+    git(app, "commit", "-q", "-m", "commit it")
+
+    deploy(remote, sync=True)
+
+    assert "Drafts now committed (become clean on staging): 1" in flat(capsys.readouterr().out)
+    assert status(rapp) == []
+
+
+def test_draft_is_absorbed_when_its_commit_reached_staging_another_way(benches):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / APP / "hooks.py", "approved\n")
+    git(app, "add", "-A")
+    deploy(remote)
+    git(app, "commit", "-q", "-m", "approved")
+    # Someone on staging moved HEAD to the commit themselves (e.g. git pull), files untouched.
+    git(rapp, "fetch", "-q", "origin")
+    git(rapp, "reset", "-q", "--soft", git(app, "rev-parse", "HEAD").strip())
+
+    deploy(remote, sync=True)
+
+    assert status(rapp) == []
+    assert ledger(remote) == {}
+
+
+def test_drafts_unstaged_on_the_server_are_staged_again(benches):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / APP / "hooks.py", "draft\n")
+    git(app, "add", "-A")
+    deploy(remote)
+    git(rapp, "reset", "-q")  # e.g. a 0.14 deploy, or someone on the server, unstaged it
+    assert status(rapp) == [f" M {APP}/hooks.py"]
+    git(app, "restore", "--staged", f"{APP}/hooks.py")  # this deploy doesn't include the draft
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", f"{APP}/api.py")
+
+    deploy(remote)
+
+    assert sorted(status(rapp)) == sorted([f"A  {APP}/api.py", f"M  {APP}/hooks.py"])

@@ -1,19 +1,44 @@
 """`benchops status`: what a server runs for an app, without logging in.
 
 Read-only — it never takes the deploy lock or changes anything. It shows
-the server's branch and commit, the last BenchOps deploy, the server's
-`git status` (the last deploy's staged files plus any work done directly
-there), and which deployed files were changed on the server since.
+the server's branch and commit, the last deploy, the pending drafts grouped
+by label and developer (flagging stale ones and ones edited on the server
+since), drafts your own machine has already committed (so a `benchops sync`
+would clear them), and hand edits made directly on the server.
 """
+
+from collections import defaultdict
+from datetime import datetime, timezone
+from pathlib import Path
 
 import typer
 from rich.console import Console
 
 from benchops.base import BaseCommand
+from benchops.gitlocal import GitError, LocalRepo
 from benchops.runner import BenchOpsConnectionError
 from benchops.sync import RemoteAgent, RemoteAgentError
 
 console = Console()
+
+STALE_AFTER_DAYS = 7
+WIDTH = 38
+
+
+def age_in_days(stamp: str | None, now: datetime | None = None) -> int | None:
+    try:
+        deployed = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S%z")
+    except (TypeError, ValueError):
+        return None
+    return ((now or datetime.now(timezone.utc)) - deployed).days
+
+
+def describe_age(days: int | None) -> str:
+    if days is None:
+        return "unknown age"
+    if days == 0:
+        return "today"
+    return "1 day ago" if days == 1 else f"{days} days ago"
 
 
 class StatusCommand(BaseCommand):
@@ -23,11 +48,24 @@ class StatusCommand(BaseCommand):
         super().__init__(server_alias=server_alias, app_name=app_name)
         self.files = files
 
-    def _section(self, title: str, items: list, fmt=str) -> None:
-        console.print(f"  {title:<38}{len(items)}")
+    def _local_blobs(self) -> dict[str, str] | None:
+        """Files in this machine's HEAD, if the app is checked out here."""
+        for candidate in (Path.cwd() / "apps" / self.app_name, Path.cwd() / self.app_name):
+            if candidate.is_dir():
+                try:
+                    return LocalRepo.open(candidate).blobs("HEAD")
+                except GitError:
+                    return None
+        return None
+
+    def _line(self, title: str, value: str, style: str | None = None) -> None:
+        text = f"  {title:<{WIDTH}}{value}"
+        console.print(f"[{style}]{text}[/{style}]" if style else text)
+
+    def _paths(self, paths) -> None:
         if self.files:
-            for item in items:
-                console.print(f"      {fmt(item)}")
+            for path in paths:
+                console.print(f"      {path}")
 
     def execute(self) -> None:
         server_config = self._get_server_config()
@@ -48,28 +86,56 @@ class StatusCommand(BaseCommand):
 
         record, lock = state.get("record") or {}, state.get("lock")
         console.print(f"[bold]{self.server_alias} / {self.app_name}[/bold]")
-        console.print(
-            f"  {'On':<38}{state.get('branch') or '(detached)'} @ {(state.get('head') or '')[:10]}  {state.get('subject') or ''}"
-        )
+        self._line("On", f"{state.get('branch') or '(detached)'} @ {(state.get('head') or '')[:10]}  {state.get('subject') or ''}")
         if record:
             staged = record.get("staged")
             what = f", {len(staged)} staged file(s)" if staged is not None else ""
-            console.print(
-                f"  {'Last deploy':<38}{record.get('deployer')} at {record.get('deployed_at')} "
-                f"({record.get('branch') or '(detached)'} @ {str(record.get('base'))[:10]}{what})"
+            label = f" [{record['label']}]" if record.get("label") else ""
+            self._line(
+                "Last deploy",
+                f"{record.get('deployer')} at {record.get('deployed_at')} "
+                f"({record.get('mode', 'deploy')}{label}, {record.get('branch') or '(detached)'} @ "
+                f"{str(record.get('base'))[:10]}{what})",
             )
         else:
-            console.print(f"  {'Last deploy':<38}none recorded")
+            self._line("Last deploy", "none recorded")
         if lock:
-            console.print(f"  [yellow]{'Deploy lock':<38}held by {lock.get('owner')} since {lock.get('started')}[/yellow]")
+            self._line("Deploy lock", f"held by {lock.get('owner')} since {lock.get('started')}", "yellow")
 
-        self._section("Changes to be committed (staged)", state["staged"], lambda c: f"{c[0]}  {c[1]}")
-        self._section("Changes not staged", state["unstaged"], lambda c: f"{c[0]}  {c[1]}")
-        self._section("Untracked files", state["untracked"])
-        if state["drifted"]:
-            console.print(f"  [yellow]{'Deployed files changed since deploy':<38}{len(state['drifted'])}[/yellow]")
-            if self.files:
-                for path in state["drifted"]:
-                    console.print(f"      {path}")
-        if not self.files and (state["staged"] or state["unstaged"] or state["untracked"]):
-            console.print("  [dim](add --files to list them)[/dim]")
+        drafts = state.get("drafts", [])
+        console.print()
+        if drafts:
+            console.print("  [bold]Pending drafts (deployed, not committed yet):[/bold]")
+            groups = defaultdict(list)
+            for draft in drafts:
+                groups[(draft.get("label") or "(no label)", draft.get("name") or draft.get("owner"))].append(draft)
+            for (label, name), items in sorted(groups.items()):
+                days = max((age_in_days(d.get("deployed_at")) or 0) for d in items)
+                stale = days >= STALE_AFTER_DAYS
+                summary = f"{name:<20} {len(items)} file(s)   {describe_age(days)}" + ("   ⚠ stale" if stale else "")
+                self._line(f"  {label}", summary, "yellow" if stale else None)
+                self._paths(d["path"] + ("   (edited on staging since)" if d["edited"] else "") for d in items)
+        else:
+            self._line("Pending drafts", "none")
+
+        local = self._local_blobs()
+        if local is not None:
+            committed = [d["path"] for d in drafts if local.get(d["path"]) == d["blob"]]
+            if committed:
+                self._line("Committed on your machine", f"{len(committed)} file(s) — run 'benchops sync'", "green")
+                self._paths(committed)
+
+        edited = [d["path"] for d in drafts if d["edited"]]
+        if edited:
+            self._line("Drafts edited on staging since", f"{len(edited)} file(s)", "yellow")
+        hand_edits = state.get("hand_edits", [])
+        self._line("Hand edits on staging", f"{len(hand_edits)} file(s)")
+        self._paths(hand_edits)
+
+        self._line(
+            "Server git status",
+            f"{len(state['staged'])} staged, {len(state['unstaged'])} not staged, {len(state['untracked'])} untracked",
+            "dim",
+        )
+        if not self.files and (drafts or hand_edits):
+            console.print("  [dim](add --files to list the files)[/dim]")

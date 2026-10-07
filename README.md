@@ -4,8 +4,8 @@ A robust Command Line Interface (CLI) tool designed to streamline and synchroniz
 
 ## Features
 
-* **Ship What You Staged:** A deploy ships your commits plus exactly what you staged with `git add` — nothing else. On the server only those files are written; work people do directly on the server is left on disk and stays visible in its `git status`, where your deploy shows as "Changes to be committed". Files changed on both sides are reported up front and are only overwritten after an explicit yes (default: no), with a backup.
-* **Conflict-Safe on Shared Servers:** A per-app deploy lock, a history check that stops a deploy when the server is on a commit you don't have, and `benchops status` to see who deployed what — without logging in.
+* **Ship What You Staged:** A deploy ships your commits plus exactly what you staged with `git add` — nothing else. On the server only those files are written; work people do directly on the server is left on disk and stays visible in its `git status`, where your deploy shows as "Changes to be committed". Each deployed file becomes your *draft* on the server — optionally labelled with a task ID — and stays staged until `benchops sync` brings the commit that contains it. Files changed on both sides are reported up front and are only overwritten after an explicit yes (default: no), with a backup.
+* **Conflict-Safe on Shared Servers:** A per-app deploy lock, a history check that stops a deploy when the server is on a commit you don't have, and `benchops status` to see every pending draft by task and developer — without logging in.
 * **Build Locally, Ship Assets:** Every deploy carries the app's locally built bundles *and* its entries from the bench's `assets.json`/`assets-rtl.json` manifests, merging them into the remote bench and invalidating Frappe's cached manifest — so the remote never needs to run `bench build`.
 * **Extensible Lifecycle Hooks:** Define custom shell commands to execute at specific stages of the deployment pipeline (`pre-local`, `pre-remote`, `post-remote`, `install-remote`, `uninstall-remote`).
 * **Embedded Multiline Editor:** Write and manage your deployment scripts directly in the terminal using a built-in interactive editor (powered by `prompt_toolkit`).
@@ -155,31 +155,47 @@ Run it from your local bench root. The app must be the root of its own git repos
 3. Your commits and index are captured as a *staged commit* (tree = your index, parent = your HEAD) with git plumbing only — your branch, index, working tree and stash are never touched.
 4. On the server BenchOps takes the app's deploy lock and checks the server's commit is in your history. A commit made on the server, or commits you haven't pulled, stop the deploy (`--force` overrides and backs the old HEAD up). A server that just ran `git pull` to a commit you also have is fine.
 5. One package is uploaded: a git bundle with your staged commit and the commits the server is missing, the build outputs (when they changed), and this app's entries from the local `sites/assets/assets*.json`.
-6. A **deploy plan** is shown: your branch and the server's, how many commits and staged files ship, what is not shipped, the files that will be written, and — in red — every **overlap**: a file you're deploying that has *different* uncommitted changes on the server. Overlaps need an explicit yes to "Overwrite these files on staging with your version?" (default **no**); with `--yes` they stop the deploy unless you also pass `--overwrite`. A file the server already has with exactly your content is not an overlap.
-7. `pre-remote` hooks run, then only the files in your deploy are written (or deleted), the server's HEAD moves to your commit on your branch, and your staged files are staged there. Overlapping files are first backed up under `refs/benchops/overwritten/<timestamp>`. Everything else on the server — other people's edits, new files, the previous deploy's changes — stays on disk. Build outputs replace the server's copy wholesale, the asset manifests are merged, and `assets_json` is cleared from `redis_cache`.
+6. A **deploy plan** is shown: your branch and the server's, how many commits and staged files ship, what is not shipped, the files that will be written, and — in red — every **overlap**: a file you're deploying that has *different* uncommitted changes on the server, either **another developer's draft** (named, with its label) or a **hand edit** made on the server. Overlaps need an explicit yes to "Overwrite these files on staging with your version?" (default **no**); with `--yes` they stop the deploy unless you also pass `--overwrite`. Not overlaps: a file the server already has with exactly your content, and **your own earlier draft** that nobody touched since. The plan also lists drafts you take over from someone else (you deploy exactly their content), drafts that become committed, and the other drafts and hand edits it leaves alone.
+7. `pre-remote` hooks run, then only the files in your deploy are written (or deleted), the server's HEAD moves to your commit on your branch, and your staged files become your **drafts**: recorded in the server's ledger (`apps/<app>/.git/benchops/ledger.json`) with your git email, the `--label` if given (a redeploy keeps the existing label), and the date, and staged there. Overlapping files are first backed up under `refs/benchops/overwritten/<timestamp>`. Everything else on the server — other developers' drafts, hand edits, new files — stays on disk. Build outputs replace the server's copy wholesale, the asset manifests are merged, and `assets_json` is cleared from `redis_cache`.
 8. The result is verified (HEAD is your commit; every deployed file matches your staged version on disk and in the index), the deploy record is written to `apps/<app>/.git/benchops/`, `bench --site all clear-cache` runs if build outputs were shipped, and `post-remote` hooks run (e.g. `bench --site {site} migrate` and `bench restart`). The lock is always released.
 
 **Afterwards, `git status` on the server** reads naturally:
 
 ```
 On branch develop
-Changes to be committed:        ← the last deploy (what its author had staged)
-Changes not staged for commit:  ← edits made on the server, and earlier deploys' changes
+Changes to be committed:        ← pending drafts: deployed by any developer, not committed yet
+Changes not staged for commit:  ← hand edits made on the server (including drafts edited there since)
 Untracked files:                ← files created on the server
 ```
 
-When a later deploy doesn't include files an earlier one staged, those files stay on disk and move to "Changes not staged", so "Changes to be committed" always shows exactly the latest deploy. If nothing would change, BenchOps says so and exits. If a file the deploy writes changes on the server while the plan is on screen (e.g. a Desk save), nothing is applied and you re-run. Servers deployed by 0.12/0.13 (HEAD on a "benchops snapshot" commit) are converted automatically on the next deploy: HEAD goes back to the real commit and those deploys' files show up in `git status`.
+A draft stays on the server, staged, until a commit contains it — there is no automatic withdrawing. If nothing would change, BenchOps says so and exits. If a file the deploy writes changes on the server while the plan is on screen (e.g. a Desk save), nothing is applied and you re-run. Servers deployed by 0.12/0.13 (HEAD on a "benchops snapshot" commit) are converted automatically on the next deploy, and the last 0.14/0.15 deploy's staged files become that developer's drafts.
 
-**Options:** `--yes`/`-y` (skip confirmation), `--overwrite` (allow overlaps with `--yes`), `--force` (deploy over a server commit that isn't in your history), `--break-lock` (take over a stale lock), `--skip-build` (ship the existing build without rebuilding).
+**Options:** `--label TASK-142` (tag the drafts, e.g. with a task ID), `--yes`/`-y` (skip confirmation), `--overwrite` (allow overlaps with `--yes`), `--force` (deploy over a server commit that isn't in your history), `--break-lock` (take over a stale lock), `--skip-build` (ship the existing build without rebuilding).
 
-**Who deployed what — `benchops status`:**
+**After approval — `benchops sync`:** once the drafts are approved, commit and push them, then
+
+```bash
+benchops sync basma dev-bench-02 --site basma.akwad.qa
+```
+
+`sync` runs the same pipeline with **commits only** — your staged files are not shipped. It moves the server to your latest commit; drafts that commit now contains exactly become clean (no longer staged). If you tidied a draft up before committing, your untouched draft is simply replaced by the committed version — no overlap warning; someone else's draft or a hand edit still asks first. Other pending drafts stay as they are. It builds only when the commits touch frontend source (`<app>/public/` or a Vite project), and runs the same hooks as a deploy (e.g. migrate and restart).
+
+**What's on the server — `benchops status`:**
 
 ```bash
 benchops status basma dev-bench-02          # counts
 benchops status basma dev-bench-02 --files  # every file
 ```
 
-It shows the server's branch and commit, the last deploy (who, when, which branch, how many staged files), the server's staged / unstaged / untracked changes, and deployed files someone changed on the server since. It's read-only and doesn't take the lock.
+```
+  Pending drafts (deployed, not committed yet):
+    TASK-142                            Mohammad Hamdan   4 file(s)   2 days ago
+    (no label)                          Ali               1 file(s)   9 days ago   ⚠ stale
+  Committed on your machine             2 file(s) — run 'benchops sync'
+  Hand edits on staging                 1 file(s)
+```
+
+It shows the server's branch and commit, the last deploy or sync, every pending draft grouped by label and developer (drafts older than 7 days are flagged stale, drafts edited on the server since are marked), drafts your machine has already committed, and hand edits. It's read-only and doesn't take the lock.
 
 **Build outputs and SPA frontends.** Build outputs are paths a build regenerates. They are shipped straight from the build and never through git, even if an old build was committed. `<app>/public/dist` is always one. For a frappe-ui/Vite frontend, the `outDir` and `indexHtmlPath` in its `vite.config.*` (at the app root or one level below, e.g. `frontend/`) are detected automatically. To declare them explicitly, or to turn detection off with an empty list, use the app's `pyproject.toml`:
 
@@ -262,7 +278,8 @@ benchops execute staging --site demo.local frappe.client.set_value \
 * `benchops --version`: Prints the installed version.
 * `benchops version [--all]`: Shows the installed version, whether a newer one is on PyPI (with the upgrade command), and the release notes for your version (`--all`: every version). Every other command also prints a one-line notice on stderr when a newer version is available — checked at most once a day; set `BENCHOPS_NO_UPDATE_CHECK=1` to turn it off. See [CHANGELOG.md](CHANGELOG.md).
 * `benchops deploy <app_name> <server_alias> [--site <site_name>]`: Deploys your commits and staged changes to a remote server.
-* `benchops status <app_name> <server_alias> [--files]`: Shows what the server runs and who deployed it.
+* `benchops sync <app_name> <server_alias> [--site <site_name>]`: Brings the server up to your latest commits; drafts those commits contain become committed.
+* `benchops status <app_name> <server_alias> [--files]`: Shows what the server runs, pending drafts by label and developer, and hand edits.
 * `benchops install <app_name> <server_alias> --site <site_name>`: Executes the install-remote hooks.
 * `benchops uninstall <app_name> <server_alias> --site <site_name>`: Executes the uninstall-remote hooks.
 * `benchops logs <server_alias> [--type frappe.log|web.error.log|worker.error.log]`: Tails bench logs in real time (Ctrl+C to stop).

@@ -5,6 +5,20 @@ version, whether a newer one is available, and what changed.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-07
+
+### Added
+- Deploy ledger on the server: every deployed uncommitted file is a *draft* with its owner (git email), label and date. Drafts from every developer stay staged on the server until committed, so "Changes to be committed" there lists all pending drafts.
+- `deploy --label TASK-142`: tag drafts with a task; a redeploy keeps the existing label.
+- `benchops sync`: bring the server up to your latest commits without shipping staged files. Drafts those commits contain become clean. Builds only when the commits touch frontend source.
+- `benchops status` groups pending drafts by label and developer, flags drafts older than 7 days, marks drafts edited on the server, shows drafts already committed on your machine, and lists hand edits.
+
+### Changed
+- Replacing your own untouched draft is no longer an overlap; replacing another developer's draft is, and the plan names them and the label.
+- Deploying exactly another developer's draft takes it over (the plan says so); its label carries over.
+- Earlier deploys' drafts stay staged on the server instead of moving to "not staged".
+
+
 ## [0.15.0] - 2026-10-06
 
 ### Added
