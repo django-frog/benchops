@@ -5,6 +5,15 @@ version, whether a newer one is available, and what changed.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-20
+
+### Added
+- `benchops restore <server> <source> --site <site>`: restore a site from a backup that Frappe's S3 Backup Settings uploaded. The server downloads it straight from S3 through short-lived presigned URLs signed with your AWS credentials, so it needs no AWS access and the data never passes through your machine.
+- Replace an existing site (type its name to confirm; a safety backup is taken first unless `--skip-safety-backup`) or create one with `--new-site`. `--from-site` restores another site's backup (e.g. production's onto staging), `--at` picks a backup by timestamp, `--no-files` restores only the database, `--admin-password` resets Administrator.
+- Downloads are checked against the sizes in S3 and with `gzip -t` before anything changes; the downloads are removed afterwards, also on failure. Signed URLs and passwords never appear on the terminal.
+- `benchops backup source add|list|remove` (S3 or S3-compatible buckets, AWS profile, region looked up automatically) and `benchops backup list <source> [--site]`.
+- `post-restore` hook phase, e.g. `bench --site {site} migrate` or disabling the scheduler on a restored production copy.
+
 ## [0.17.0] - 2026-10-20
 
 ### Added

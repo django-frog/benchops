@@ -272,3 +272,38 @@ class ConfigManager:
 
     def remove_project(self, name: str) -> None:
         self._remove_table_entry("projects", name.strip(), "Project")
+
+    # --- S3 backup sources ------------------------------------------------
+    # Where Frappe's S3 Backup Settings upload site backups. AWS credentials
+    # are never stored here: a source names an AWS profile, or falls back to
+    # the default AWS credential chain.
+
+    def set_backup_source(
+        self,
+        name: str,
+        bucket: str,
+        prefix: str | None = None,
+        aws_profile: str | None = None,
+        aws_region: str | None = None,
+        endpoint_url: str | None = None,
+    ) -> None:
+        entry = tomlkit.inline_table()
+        entry["bucket"] = bucket.strip()
+        for key, value in (
+            ("prefix", prefix.strip("/") if prefix else None),
+            ("aws_profile", aws_profile),
+            ("aws_region", aws_region),
+            ("endpoint_url", endpoint_url),
+        ):
+            if value:
+                entry[key] = value
+        self._write_table_entry("backup_sources", name.strip(), entry)
+
+    def get_backup_source(self, name: str) -> dict | None:
+        return self.list_backup_sources().get(name.strip())
+
+    def list_backup_sources(self) -> dict:
+        return self._read_table("backup_sources")
+
+    def remove_backup_source(self, name: str) -> None:
+        self._remove_table_entry("backup_sources", name.strip(), "Backup source")

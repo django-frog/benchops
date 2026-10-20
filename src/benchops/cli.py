@@ -11,6 +11,7 @@ from rich.console import Console
 from rich.table import Table
 
 from benchops.auth import AuthManager, KeyringUnavailableError
+from benchops.backups import BackupSourceError, S3Backups, human_size
 from benchops.clone import DEFAULT_JOBS, CloneCommand
 from benchops.config import ConfigManager
 from benchops.deploy import DeployCommand
@@ -18,6 +19,7 @@ from benchops.execute import ExecuteCommand
 from benchops.install import InstallCommand
 from benchops.logs import LogsCommand, LogType
 from benchops.projects import load_manifest, validate_project
+from benchops.restore import RestoreCommand
 from benchops.runner import BenchOpsConnectionError
 from benchops.status import StatusCommand
 from benchops.uninstall import UninstallCommand
@@ -33,6 +35,7 @@ class HookPhase(str, Enum):
     post_remote = "post-remote"
     install_remote = "install-remote"
     uninstall_remote = "uninstall-remote"
+    post_restore = "post-restore"
 
 
 class ConnectionType(str, Enum):
@@ -67,6 +70,10 @@ git_app = typer.Typer(help="Manage git hosting tokens used by 'benchops clone'."
 app.add_typer(git_app, name="git")
 project_app = typer.Typer(help="Manage clone projects: named groups of repositories.")
 app.add_typer(project_app, name="project")
+backup_app = typer.Typer(help="Browse site backups that Frappe uploaded to S3.")
+app.add_typer(backup_app, name="backup")
+backup_source_app = typer.Typer(help="Manage S3 backup sources: the buckets Frappe uploads backups to.")
+backup_app.add_typer(backup_source_app, name="source")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -181,6 +188,7 @@ def list_servers() -> None:
     table.add_column("Post-Remote", justify="center")
     table.add_column("Install-Remote", justify="center")
     table.add_column("Uninstall-Remote", justify="center")
+    table.add_column("Post-Restore", justify="center")
 
     for alias, config in sorted(servers.items()):
         table.add_row(
@@ -196,6 +204,7 @@ def list_servers() -> None:
             _render_hook_count(config, "post_remote_commands"),
             _render_hook_count(config, "install_remote_commands"),
             _render_hook_count(config, "uninstall_remote_commands"),
+            _render_hook_count(config, "post_restore_commands"),
         )
     console.print(table)
 
@@ -544,6 +553,132 @@ def execute(
     """Run a single Python method on a remote site via `bench execute` — never an interactive shell."""
     command = ExecuteCommand(server_alias=server_alias, site=site, method=method, args=args, kwargs=kwargs)
     command.execute()
+
+
+@app.command("restore")
+def restore(
+    server_alias: str = typer.Argument(..., help="Alias of the target server."),
+    source: str = typer.Argument(..., help="Backup source to restore from (see 'benchops backup source list')."),
+    site: str = typer.Option(..., "--site", help="Site to restore on the server."),
+    from_site: str | None = typer.Option(
+        None, "--from-site", help="Site whose backup to restore, when it differs from --site (e.g. production's)."
+    ),
+    at: str | None = typer.Option(
+        None, "--at", help="Backup to restore: 'latest' (default) or a timestamp prefix like 20261019 or 20261019_0200."
+    ),
+    new_site: bool = typer.Option(False, "--new-site", help="Create --site from the backup instead of replacing it."),
+    with_files: bool = typer.Option(True, "--files/--no-files", help="Restore public and private files too."),
+    admin_password: str | None = typer.Option(
+        None, "--admin-password", help="Set the Administrator password after restoring (default: the backup's)."
+    ),
+    skip_safety_backup: bool = typer.Option(
+        False, "--skip-safety-backup", help="Don't back up the site before replacing it."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Restore without asking for confirmation."),
+) -> None:
+    """Restore a site on a remote server from a backup in S3; the server downloads it directly."""
+    RestoreCommand(
+        server_alias=server_alias,
+        source_name=source,
+        site=site,
+        from_site=from_site,
+        at=at,
+        new_site=new_site,
+        with_files=with_files,
+        admin_password=admin_password,
+        safety_backup=not skip_safety_backup,
+        yes=yes,
+    ).execute()
+
+
+@backup_source_app.command("add")
+def backup_source_add(
+    name: str = typer.Argument(..., help="Name for this source, used as 'benchops backup list <name>'."),
+    bucket: str = typer.Option(..., "--bucket", help="Bucket name set in Frappe's S3 Backup Settings."),
+    prefix: str | None = typer.Option(None, "--prefix", help="Key prefix in front of the backup folders, if any."),
+    aws_profile: str | None = typer.Option(None, help="Named AWS CLI profile (default: the default AWS credentials)."),
+    aws_region: str | None = typer.Option(None, help="Bucket region (default: looked up from the bucket)."),
+    endpoint_url: str | None = typer.Option(None, help="Endpoint of an S3-compatible store (MinIO, Wasabi, ...)."),
+) -> None:
+    """Add or update an S3 backup source, after checking it can be read."""
+    entry = {"bucket": bucket, "prefix": prefix, "aws_profile": aws_profile,
+             "aws_region": aws_region, "endpoint_url": endpoint_url}
+    try:
+        sets = S3Backups(entry).list_sets()
+    except BackupSourceError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+    ConfigManager().set_backup_source(name, bucket, prefix, aws_profile, aws_region, endpoint_url)
+    sites = len({b.site_slug for b in sets})
+    console.print(f"[green]Backup source '{name}' saved: {len(sets)} backup(s) of {sites} site(s) found.[/green]")
+
+
+@backup_source_app.command("list")
+def backup_source_list() -> None:
+    """List S3 backup sources."""
+    sources = ConfigManager().list_backup_sources()
+    if not sources:
+        console.print("[yellow]No backup sources yet. Run 'benchops backup source add'.[/yellow]")
+        return
+    table = Table(title="Backup Sources")
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Location")
+    table.add_column("AWS Profile")
+    table.add_column("Region / Endpoint")
+    for name, source in sorted(sources.items()):
+        location = f"s3://{source['bucket']}/{source.get('prefix') or ''}".rstrip("/")
+        table.add_row(name, location, source.get("aws_profile") or "[dim]default[/dim]",
+                      source.get("endpoint_url") or source.get("aws_region") or "[dim]auto[/dim]")
+    console.print(table)
+
+
+@backup_source_app.command("remove")
+def backup_source_remove(name: str = typer.Argument(..., help="Backup source name.")) -> None:
+    """Remove a backup source (nothing in S3 is touched)."""
+    try:
+        ConfigManager().remove_backup_source(name)
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]Backup source '{name}' removed.[/green]")
+
+
+@backup_app.command("list")
+def backup_list(
+    source: str = typer.Argument(..., help="Backup source name."),
+    site: str | None = typer.Option(None, "--site", help="Only backups of this site."),
+    limit: int = typer.Option(10, "--limit", "-n", help="Show this many of the newest backups (0: all)."),
+) -> None:
+    """List the backups in a source, newest first."""
+    entry = ConfigManager().get_backup_source(source)
+    if entry is None:
+        console.print(f"[red]Error: Backup source '{source}' not found.[/red]")
+        raise typer.Exit(1)
+    try:
+        sets = S3Backups(entry).list_sets(site)
+    except BackupSourceError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+    if not sets:
+        console.print("[yellow]No Frappe backups found" + (f" for '{site}'." if site else ".") + "[/yellow]")
+        return
+
+    def size(part) -> str:
+        return human_size(part.size) if part else "[dim]—[/dim]"
+
+    shown = sets[:limit] if limit > 0 else sets
+    table = Table(title=f"Backups in '{source}'" + (f" ({len(shown)} of {len(sets)})" if len(shown) < len(sets) else ""))
+    table.add_column("Stamp (--at)", style="bold cyan", no_wrap=True)
+    table.add_column("Taken")
+    table.add_column("Site")
+    table.add_column("Database", justify="right")
+    table.add_column("Public Files", justify="right")
+    table.add_column("Private Files", justify="right")
+    for backup in shown:
+        database = size(backup.database) if backup.restorable else "[red]missing[/red]"
+        table.add_row(backup.stamp, f"{backup.taken_at:%Y-%m-%d %H:%M}", backup.site_slug, database,
+                      size(backup.public_files), size(backup.private_files))
+    console.print(table)
 
 
 def _normalize_host(value: str) -> str:

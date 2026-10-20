@@ -15,6 +15,7 @@ A robust Command Line Interface (CLI) tool designed to streamline and synchroniz
 * **SSM-Bootstrapped Trust:** `benchops auth setup-keys` generates a BenchOps-managed ed25519 keypair and installs the public half onto the instance via an SSM RunCommand — no pre-existing SSH access required.
 * **Cross-Platform by Design:** Works natively on Linux, macOS, and Windows (PowerShell/cmd.exe) — no WSL required. Local hooks, file permissions, and the SSM tunnel all dispatch to OS-appropriate implementations under the hood.
 * **Bulk Cloning with Access Checks:** `benchops clone <project>` clones every repository of a project in parallel — public or on a private GitHub, GitLab, Gitea or plain git host. Your token is checked first and each repository shows your role (read / write / admin); repositories you can't read are skipped with the reason, and existing folders are never overwritten.
+* **Restore Sites from S3:** `benchops restore` restores a site from the backups Frappe's S3 Backup Settings upload — replacing a site (after a safety backup) or creating a new one. The server downloads straight from S3 through short-lived presigned URLs, so it needs no AWS credentials of its own.
 * **Live Log Tailing:** `benchops logs` streams `frappe.log`, `web.error.log`, and/or `worker.error.log` from the bench in real time, over either transport.
 * **Safe Ad-Hoc Execution:** `benchops execute` runs a single whitelisted Python method via `bench execute` — no interactive shell is ever opened on the target instance.
 
@@ -121,6 +122,7 @@ You can write generic hooks that apply to any deployment by using these placehol
 * `post-remote`: Runs on the remote server after extraction (e.g., database migrations, clearing cache).
 * `install-remote`: Runs exactly once when using the `install` command (e.g., `bench --site {site} install-app {app}`).
 * `uninstall-remote`: Runs exactly once when using the `uninstall` command (e.g., `bench --site {site} uninstall-app {app}`).
+* `post-restore`: Runs on the remote server after `benchops restore` (e.g., `bench --site {site} migrate`, `bench --site {site} disable-scheduler`).
 
 **Editing Hooks:**
 Open the interactive terminal editor for a specific phase:
@@ -345,6 +347,44 @@ Conflicts are never resolved by overwriting. Each repository is cloned into a te
 
 Useful options: `--only core,hr` / `--skip 'legacy_*'` (folder, path or glob), `--branch version-15`, `--depth 1` (shallow), `--partial` (full history, file contents fetched on demand — much faster for large repos; sets up the credential helper so later fetches can authenticate), `--persist-credentials` (later `git pull` uses the stored token through `benchops git credential`, still nothing in plain text), `--protocol ssh`, `--yes`.
 
+## Restoring a Site from S3
+
+`benchops restore` restores a site on a configured server from the backups that Frappe's **S3 Backup Settings** upload (`<bucket>/<YYYYMMDD_HHMMSS>/<YYYYMMDD_HHMMSS>-<site>-database.sql.gz`, `-files.tar`, `-private-files.tar`). Several sites can share a bucket; backups are matched by site name.
+
+### 1. Add the bucket as a backup source
+
+```bash
+benchops backup source add prod --bucket akwad-erp-backups --aws-profile prod-readonly
+benchops backup list prod --site erp.akwad.qa
+```
+
+`source add` checks it can list the bucket before saving. Your AWS identity needs `s3:ListBucket` and `s3:GetObject` (and `s3:GetBucketLocation` when you don't pass `--aws-region`). For MinIO, Wasabi and other S3-compatible stores pass `--endpoint-url`. No AWS credentials are stored by BenchOps.
+
+### 2. Restore
+
+```bash
+# Replace staging's copy of the site with its newest backup
+benchops restore staging prod --site erp.akwad.qa
+
+# Production's backup of 19 Oct as a new site on staging, database only
+benchops restore staging prod --site uat.akwad.qa --from-site erp.akwad.qa --new-site --at 20261019 --no-files
+```
+
+What happens:
+
+1. The backup is picked in S3: the newest one with a database dump, or the newest whose timestamp starts with `--at`.
+2. The server is checked: the site must exist (or must not, with `--new-site`), `curl` must be installed, and free disk space is compared with the download.
+3. A plan is shown. Replacing a site asks you to **type its name**; `--yes` skips the question.
+4. The server downloads the files straight from S3 through presigned URLs that expire after an hour. Sizes are checked against S3 and the dump with `gzip -t` before anything changes.
+5. A safety backup of the site being replaced is taken into `sites/<site>/private/backups` (skip with `--skip-safety-backup`), or the site is created with `bench new-site` (`--new-site`). Then `bench --site <site> restore` runs, followed by the `post-restore` hooks.
+6. The downloaded files are removed, also when a step fails.
+
+**Database root password:** if `root_password` is in the bench's `common_site_config.json` (or the site's config), nothing is asked. Otherwise you're prompted for it, or it's read from `BENCHOPS_DB_ROOT_PASSWORD` (required with `--yes`). It's never printed, but it's passed to `bench` as an argument, so it's visible in the server's process list while bench runs.
+
+**Administrator:** the restored site keeps the backup's Administrator password unless you pass `--admin-password`.
+
+The apps installed in the backup must also be installed on the bench, ideally at the same versions; add `bench --site {site} migrate` as a `post-restore` hook when they differ. Encrypted backups (Frappe's `backup_encryption_key`) aren't supported yet.
+
 ## CLI Command Reference
 
 ### Global Commands
@@ -359,6 +399,8 @@ Useful options: `--only core,hr` / `--skip 'legacy_*'` (folder, path or glob), `
 * `benchops uninstall <app_name> <server_alias> --site <site_name>`: Executes the uninstall-remote hooks.
 * `benchops logs <server_alias> [--type frappe.log|web.error.log|worker.error.log]`: Tails bench logs in real time (Ctrl+C to stop).
 * `benchops execute <server_alias> --site <site_name> <method> [--args <json>] [--kwargs <json>]`: Runs a single Python method via `bench execute` — no interactive shell.
+
+* `benchops restore <server_alias> <source> --site <site> [--from-site ...] [--at latest|STAMP] [--new-site] [--no-files] [--admin-password ...] [--skip-safety-backup] [--yes]`: Restores a site from an S3 backup — see [Restoring a Site from S3](#restoring-a-site-from-s3).
 
 * `benchops clone <project|manifest.toml> [--into DIR] [-j N] [--dry-run] [--update] [--retry-failed] [--only ...] [--skip ...]`: Clones a project's repositories in parallel after checking your access — see [Bulk Cloning a Project](#bulk-cloning-a-project).
 
@@ -387,6 +429,12 @@ Useful options: `--only core,hr` / `--skip 'legacy_*'` (folder, path or glob), `
 
 * `add <name> [--manifest file.toml | --host ... --repo ... --group ... --match ... --branch ... --protocol ...] [--replace]`: Define a project.
 * `list` / `show <name>` / `remove <name>`: Inspect or delete projects (removing never touches cloned folders).
+
+### Backups (`benchops backup`)
+
+* `source add <name> --bucket ... [--prefix ...] [--aws-profile ...] [--aws-region ...] [--endpoint-url ...]`: Save an S3 backup source after checking it can be read.
+* `source list` / `source remove <name>`: Inspect or delete sources (nothing in S3 is touched).
+* `list <source> [--site <site>] [-n N]`: The newest backups, with the stamp to pass as `--at`.
 
 ## Testing Your Changes
 
