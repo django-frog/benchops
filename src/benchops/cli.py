@@ -38,6 +38,11 @@ class HookPhase(str, Enum):
     post_restore = "post-restore"
 
 
+class LocalHookPhase(str, Enum):
+    """Hook phases for the bench on this machine."""
+    post_restore = "post-restore"
+
+
 class ConnectionType(str, Enum):
     """Supported transports for reaching a configured server."""
     ssh = "ssh"
@@ -74,6 +79,8 @@ backup_app = typer.Typer(help="Browse site backups that Frappe uploaded to S3.")
 app.add_typer(backup_app, name="backup")
 backup_source_app = typer.Typer(help="Manage S3 backup sources: the buckets Frappe uploads backups to.")
 backup_app.add_typer(backup_source_app, name="source")
+local_app = typer.Typer(help="Hooks for the bench on this machine (used by 'benchops restore --local').")
+app.add_typer(local_app, name="local")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -449,6 +456,32 @@ def clear_hooks(
         raise typer.Exit(1)
 
 
+def _edit_commands(existing_commands: list[str]) -> list[str] | None:
+    """Edit commands in the embedded editor, one per line; None if cancelled.
+    Blank lines and # comments are dropped."""
+    initial_text = "\n".join(existing_commands)
+    if initial_text:
+        initial_text += "\n"
+
+    try:
+        edited_text = prompt(
+            "",
+            default=initial_text,
+            multiline=True,
+            bottom_toolbar=HTML(" Press <b>[Esc]</b> then <b>[Enter]</b> to save | <b>[Ctrl+C]</b> to cancel "),
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Edit cancelled. No changes were made.[/yellow]")
+        return None
+
+    new_commands = []
+    for line in edited_text.splitlines():
+        cleaned_line = line.strip()
+        if cleaned_line and not cleaned_line.startswith("#"):
+            new_commands.append(cleaned_line)
+    return new_commands
+
+
 @server_app.command("edit-hooks")
 def edit_hooks(
     alias: str = typer.Argument(..., help="Alias of the configured server."),
@@ -463,28 +496,10 @@ def edit_hooks(
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1)
 
-    initial_text = "\n".join(existing_commands)
-    if initial_text:
-        initial_text += "\n"
-
     console.print(f"[cyan]Editing {phase.value} hooks for '{alias}'...[/cyan]")
-
-    try:
-        edited_text = prompt(
-            "",
-            default=initial_text,
-            multiline=True,
-            bottom_toolbar=HTML(" Press <b>[Esc]</b> then <b>[Enter]</b> to save | <b>[Ctrl+C]</b> to cancel "),
-        )
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Edit cancelled. No changes were made.[/yellow]")
+    new_commands = _edit_commands(existing_commands)
+    if new_commands is None:
         return
-
-    new_commands = []
-    for line in edited_text.splitlines():
-        cleaned_line = line.strip()
-        if cleaned_line and not cleaned_line.startswith("#"):
-            new_commands.append(cleaned_line)
 
     try:
         config_mgr.set_hooks(alias, phase.value, new_commands)
@@ -557,9 +572,14 @@ def execute(
 
 @app.command("restore")
 def restore(
-    server_alias: str = typer.Argument(..., help="Alias of the target server."),
     source: str = typer.Argument(..., help="Backup source to restore from (see 'benchops backup source list')."),
-    site: str = typer.Option(..., "--site", help="Site to restore on the server."),
+    legacy_source: str | None = typer.Argument(None, hidden=True),
+    site: str = typer.Option(..., "--site", help="Site to restore."),
+    server_alias: str | None = typer.Option(None, "--server", help="Restore on this configured server."),
+    local: bool = typer.Option(False, "--local", help="Restore on the bench on this machine."),
+    bench: Path | None = typer.Option(
+        None, "--bench", help="Local bench root for --local (default: the current directory)."
+    ),
     from_site: str | None = typer.Option(
         None, "--from-site", help="Site whose backup to restore, when it differs from --site (e.g. production's)."
     ),
@@ -576,11 +596,25 @@ def restore(
     ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Restore without asking for confirmation."),
 ) -> None:
-    """Restore a site on a remote server from a backup in S3; the server downloads it directly."""
+    """Restore a site from a backup in S3, on a server (--server) or on your local bench (--local)."""
+    if legacy_source is not None:
+        # 0.18.0 took the server first: `benchops restore <server> <source>`.
+        console.print(
+            f"[red]Error: The server is now an option: benchops restore {legacy_source} --server {source} "
+            "(or --local).[/red]"
+        )
+        raise typer.Exit(1)
+    if bool(server_alias) == local:
+        console.print("[red]Error: Pass either --server <alias> or --local.[/red]")
+        raise typer.Exit(1)
+    if bench is not None and not local:
+        console.print("[red]Error: --bench only applies with --local.[/red]")
+        raise typer.Exit(1)
     RestoreCommand(
-        server_alias=server_alias,
         source_name=source,
         site=site,
+        server_alias=server_alias,
+        bench=bench,
         from_site=from_site,
         at=at,
         new_site=new_site,
@@ -679,6 +713,46 @@ def backup_list(
         table.add_row(backup.stamp, f"{backup.taken_at:%Y-%m-%d %H:%M}", backup.site_slug, database,
                       size(backup.public_files), size(backup.private_files))
     console.print(table)
+
+
+@local_app.command("add-hook")
+def local_add_hook(
+    phase: LocalHookPhase = typer.Argument(..., help="The phase to attach the command to."),
+    cmd: str = typer.Argument(..., help="The command string to execute (enclose in quotes)."),
+) -> None:
+    """Add a command hook for the local bench."""
+    ConfigManager().add_local_hook(phase.value, cmd)
+    console.print(f"[green]Successfully added command to local {phase.value} hooks.[/green]")
+
+
+@local_app.command("clear-hooks")
+def local_clear_hooks(phase: LocalHookPhase = typer.Argument(..., help="The phase to clear.")) -> None:
+    """Clear the local bench's hooks for a phase."""
+    ConfigManager().set_local_hooks(phase.value, [])
+    console.print(f"[green]Successfully cleared local {phase.value} hooks.[/green]")
+
+
+@local_app.command("edit-hooks")
+def local_edit_hooks(phase: LocalHookPhase = typer.Argument(..., help="The phase to edit.")) -> None:
+    """Open the embedded multiline editor for the local bench's hooks."""
+    config_mgr = ConfigManager()
+    console.print(f"[cyan]Editing local {phase.value} hooks...[/cyan]")
+    new_commands = _edit_commands(config_mgr.get_local_hooks(phase.value))
+    if new_commands is None:
+        return
+    config_mgr.set_local_hooks(phase.value, new_commands)
+    console.print(f"[green]Successfully saved {len(new_commands)} commands to local {phase.value} hooks.[/green]")
+
+
+@local_app.command("list-hooks")
+def local_list_hooks() -> None:
+    """Show the local bench's hooks."""
+    config_mgr = ConfigManager()
+    for phase in LocalHookPhase:
+        commands = config_mgr.get_local_hooks(phase.value)
+        console.print(f"[bold]{phase.value}[/bold]" + ("" if commands else "  [dim]none[/dim]"))
+        for cmd in commands:
+            console.print(f"  {cmd}")
 
 
 def _normalize_host(value: str) -> str:

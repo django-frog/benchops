@@ -307,3 +307,28 @@ class ConfigManager:
 
     def remove_backup_source(self, name: str) -> None:
         self._remove_table_entry("backup_sources", name.strip(), "Backup source")
+
+    # --- Local bench --------------------------------------------------------
+    # Hooks for commands that act on the bench on this machine
+    # (`benchops restore --local`), kept apart from every server's.
+
+    def get_local_hooks(self, phase: str) -> list[str]:
+        return list(self._read_table("local").get(self._get_hook_key(phase)) or [])
+
+    def set_local_hooks(self, phase: str, commands: list[str]) -> None:
+        self.init_config()
+        doc = self._read()
+        if "local" not in doc:
+            doc["local"] = tomlkit.table()
+        key = self._get_hook_key(phase)
+        if commands:
+            array = tomlkit.array()
+            for cmd in commands:
+                array.append(cmd)
+            doc["local"][key] = array
+        elif key in doc["local"]:
+            del doc["local"][key]
+        TOMLFile(self.config_path).write(doc)
+
+    def add_local_hook(self, phase: str, command: str) -> None:
+        self.set_local_hooks(phase, self.get_local_hooks(phase) + [command])

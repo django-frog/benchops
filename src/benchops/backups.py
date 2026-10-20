@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import boto3
+import boto3.exceptions
 import botocore.config
 import botocore.exceptions
 
@@ -197,6 +198,16 @@ class S3Backups:
 
     def list_sets(self, site: str | None = None) -> list[BackupSet]:
         return group_backups(self._objects(), site)
+
+    def download(self, key: str, path: str, progress=None) -> None:
+        """Download one object to `path` (multipart and parallel for large
+        files); `progress` is called with the bytes received since the last call."""
+        try:
+            self._client.download_file(self.bucket, key, path, Callback=progress)
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+            raise self._error(exc) from exc
+        except boto3.exceptions.Boto3Error as exc:
+            raise BackupSourceError(f"Downloading {key} failed: {exc}") from exc
 
     def presign(self, key: str, expires: int = DEFAULT_URL_EXPIRY_SECONDS) -> str:
         return self._call(

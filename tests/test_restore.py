@@ -114,7 +114,7 @@ def setup(tmp_path, monkeypatch):
 
 
 def invoke(*args, input=None):
-    return CliRunner().invoke(cli.app, ["restore", "staging", "prod", *args], input=input)
+    return CliRunner().invoke(cli.app, ["restore", "prod", "--server", "staging", *args], input=input)
 
 
 def test_replace_downloads_backs_up_restores_and_cleans_up(setup):
@@ -200,7 +200,7 @@ def test_failed_restore_hides_the_command_and_names_the_safety_backup(setup, mon
     runner = use(FakeRunner(root_password=False, fail_on=" restore "))
     result = invoke("--site", "erp.akwad.qa", "--yes", "--admin-password", "adm1n")
     assert result.exit_code == 1
-    assert "exit code 2" in result.output and "private/backups" in result.output
+    assert "exit code 2" in result.output and "private/backups" in " ".join(result.output.split())
     assert "s3cret-root" not in result.output and "adm1n" not in result.output
     assert runner.captures[-1] == f"rm -rf {WORKDIR}"
 
@@ -368,9 +368,9 @@ def test_s3_failure_while_signing_is_reported(setup, monkeypatch):
 def test_unknown_source_and_unknown_server(setup):
     _, use = setup
     use(FakeRunner())
-    result = CliRunner().invoke(cli.app, ["restore", "staging", "nope", "--site", "erp.akwad.qa"])
+    result = CliRunner().invoke(cli.app, ["restore", "nope", "--server", "staging", "--site", "erp.akwad.qa"])
     assert result.exit_code == 1 and "Backup source 'nope' not found" in result.output
-    result = CliRunner().invoke(cli.app, ["restore", "prod-server", "prod", "--site", "erp.akwad.qa"])
+    result = CliRunner().invoke(cli.app, ["restore", "prod", "--server", "prod-server", "--site", "erp.akwad.qa"])
     assert result.exit_code == 1 and "Server 'prod-server' not found" in result.output
 
 

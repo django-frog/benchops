@@ -5,6 +5,15 @@ version, whether a newer one is available, and what changed.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-10-20
+
+### Added
+- `benchops restore <source> --site <site> --local`: restore into the bench on this machine (the current directory, or `--bench PATH`). Downloads with your AWS credentials, with a progress bar, into a temporary folder inside the bench; sizes and the dump's gzip stream are verified before anything changes. Every option of a server restore works the same way.
+- `benchops local add-hook|edit-hooks|clear-hooks|list-hooks post-restore`: commands run after a local restore, kept apart from every server's hooks.
+
+### Changed
+- `benchops restore` takes the server as an option: `benchops restore <source> --site <site> --server <alias>` instead of `benchops restore <server> <source> ...`. The 0.18.0 form prints the new one.
+
 ## [0.18.0] - 2026-10-20
 
 ### Added

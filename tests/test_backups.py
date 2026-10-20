@@ -1,7 +1,11 @@
 """Finding Frappe backups in an S3 listing and picking one to restore."""
 
+import io
+
+import boto3.exceptions
 import botocore.exceptions
 import pytest
+from botocore.response import StreamingBody
 from botocore.stub import Stubber
 
 from benchops.backups import (
@@ -250,3 +254,46 @@ def test_network_failures_are_named(fake_session):
     session.error = botocore.exceptions.EndpointConnectionError(endpoint_url="https://s3.me-south-1.amazonaws.com")
     with pytest.raises(BackupSourceError, match="Failed to reach S3"):
         S3Backups({"bucket": "b", "aws_region": "me-south-1"}).list_sets()
+
+
+# --- download -------------------------------------------------------------------
+
+
+def test_download_writes_the_object_and_reports_progress(aws_env, tmp_path):
+    data = b"x" * 4096
+    s3, stub = stubbed({"bucket": "akwad-backups", "aws_region": "me-south-1"})
+    stub.add_response("head_object", {"ContentLength": len(data)}, {"Bucket": "akwad-backups", "Key": "k"})
+    stub.add_response(
+        "get_object",
+        {"Body": StreamingBody(io.BytesIO(data), len(data)), "ContentLength": len(data)},
+    )
+    received = []
+    with stub:
+        s3.download("k", str(tmp_path / "out"), received.append)
+    assert (tmp_path / "out").read_bytes() == data and sum(received) == len(data)
+
+
+@pytest.mark.parametrize("error, message", [
+    (botocore.exceptions.ClientError({"Error": {"Code": "403"}}, "HeadObject"), "denied"),
+    (botocore.exceptions.ClientError({"Error": {"Code": "404"}}, "HeadObject"), "S3 rejected the request"),
+])
+def test_download_errors_are_translated(aws_env, tmp_path, error, message):
+    s3 = S3Backups({"bucket": "b", "aws_region": "me-south-1"})
+
+    def fail(*args, **kwargs):
+        raise error
+
+    s3._client.download_file = fail
+    with pytest.raises(BackupSourceError, match=message):
+        s3.download("k", str(tmp_path / "out"))
+
+
+def test_transfer_failures_are_translated(aws_env, tmp_path):
+    s3 = S3Backups({"bucket": "b", "aws_region": "me-south-1"})
+
+    def fail(*args, **kwargs):
+        raise boto3.exceptions.S3TransferFailedError("retries exceeded")
+
+    s3._client.download_file = fail
+    with pytest.raises(BackupSourceError, match="Downloading k failed: retries exceeded"):
+        s3.download("k", str(tmp_path / "out"))
