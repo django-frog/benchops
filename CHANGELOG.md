@@ -5,6 +5,17 @@ version, whether a newer one is available, and what changed.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-20
+
+### Added
+- `benchops clone <project>`: clone every repository of a project in parallel (`-j`, default 4), from public hosts and private GitHub / GitHub Enterprise, GitLab, Gitea / Forgejo or any git host.
+- Projects: `benchops project add|list|show|remove`, from options or a shareable TOML manifest; repositories listed by path or URL, discovered from an org / group (`group`, `match`), or both. `benchops clone` also accepts a manifest file directly.
+- `benchops git login|whoami|hosts|logout`: per-host tokens, verified before saving and kept in the system keyring (or `BENCHOPS_GIT_TOKEN_<HOST>`). Tokens reach git as an HTTPS header scoped to their host — never in URLs, argv or `.git/config` — and are masked in all output.
+- Role-aware plan before cloning: your access (read / write / admin) per repository from the host, `min_access` per repository, token scope and expiry warnings, and a `git ls-remote` check that the branch exists and git accepts the token.
+- Conflict safety: folders holding another repository, non-empty non-git folders and two repositories mapped to one folder are reported and never overwritten; clones land via a temporary folder and an atomic rename; a lock file prevents concurrent runs into the same directory.
+- Repository URLs with embedded credentials are rejected in projects and manifests (use `benchops git login`); an unwritable target directory is a clear error; a failure during the clone phase always sets a non-zero exit code.
+- `--dry-run`, `--update` (fetch + fast-forward only when clean), `--retry-failed`, `--only` / `--skip`, `--branch`, `--depth`, `--partial` (blob-less clone), `--protocol ssh|https`, `--persist-credentials` (credential helper backed by the keyring).
+
 ## [0.16.0] - 2026-10-07
 
 ### Added

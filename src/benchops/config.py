@@ -199,3 +199,76 @@ class ConfigManager:
 
         server[config_key] = array
         TOMLFile(self.config_path).write(doc)
+
+    # --- Git hosts and clone projects -------------------------------------
+    # Kept in their own tables, apart from [servers], so a project or git host
+    # can share a name with a server alias without either overwriting the other.
+
+    def _write_table_entry(self, table: str, key: str, entry) -> None:
+        self.init_config()
+        doc = self._read()
+        if table not in doc:
+            doc[table] = tomlkit.table()
+        doc[table][key] = entry
+        TOMLFile(self.config_path).write(doc)
+
+    def _read_table(self, table: str) -> dict:
+        try:
+            doc = self._read()
+        except FileNotFoundError:
+            return {}
+        return {str(k).strip(): v.unwrap() if hasattr(v, "unwrap") else v for k, v in (doc.get(table) or {}).items()}
+
+    def _remove_table_entry(self, table: str, key: str, what: str) -> None:
+        try:
+            doc = self._read()
+        except FileNotFoundError:
+            raise ValueError("Configuration file not found.")
+        if key not in (doc.get(table) or {}):
+            raise ValueError(f"{what} '{key}' not found in configuration.")
+        del doc[table][key]
+        TOMLFile(self.config_path).write(doc)
+
+    def set_git_host(self, host: str, provider: str, api_url: str | None = None, username: str | None = None) -> None:
+        """Record which provider a git host runs; its token lives in the keyring."""
+        entry = tomlkit.inline_table()
+        entry["provider"] = provider
+        if api_url:
+            entry["api_url"] = api_url
+        if username:
+            entry["username"] = username
+        self._write_table_entry("git_hosts", host.strip().lower(), entry)
+
+    def get_git_host(self, host: str) -> dict | None:
+        return self.list_git_hosts().get(host.strip().lower())
+
+    def list_git_hosts(self) -> dict:
+        return self._read_table("git_hosts")
+
+    def remove_git_host(self, host: str) -> None:
+        self._remove_table_entry("git_hosts", host.strip().lower(), "Git host")
+
+    def set_project(self, name: str, project: dict) -> None:
+        """Add or replace a clone project (see benchops.projects for the schema)."""
+        entry = tomlkit.table()
+        for key, value in project.items():
+            if key == "repos":
+                repos = tomlkit.array()
+                for repo in value:
+                    item = tomlkit.inline_table()
+                    item.update(repo)
+                    repos.append(item)
+                repos.multiline(True)
+                entry["repos"] = repos
+            elif value is not None:
+                entry[key] = value
+        self._write_table_entry("projects", name.strip(), entry)
+
+    def get_project(self, name: str) -> dict | None:
+        return self.list_projects().get(name.strip())
+
+    def list_projects(self) -> dict:
+        return self._read_table("projects")
+
+    def remove_project(self, name: str) -> None:
+        self._remove_table_entry("projects", name.strip(), "Project")

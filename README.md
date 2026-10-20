@@ -14,6 +14,7 @@ A robust Command Line Interface (CLI) tool designed to streamline and synchroniz
 * **Zero-Trust Access via AWS SSM:** Connect to EC2 instances with port 22 closed entirely, by tunneling SSH through an AWS Systems Manager Session Manager port-forwarding session (`connection_type = "ssm"`).
 * **SSM-Bootstrapped Trust:** `benchops auth setup-keys` generates a BenchOps-managed ed25519 keypair and installs the public half onto the instance via an SSM RunCommand — no pre-existing SSH access required.
 * **Cross-Platform by Design:** Works natively on Linux, macOS, and Windows (PowerShell/cmd.exe) — no WSL required. Local hooks, file permissions, and the SSM tunnel all dispatch to OS-appropriate implementations under the hood.
+* **Bulk Cloning with Access Checks:** `benchops clone <project>` clones every repository of a project in parallel — public or on a private GitHub, GitLab, Gitea or plain git host. Your token is checked first and each repository shows your role (read / write / admin); repositories you can't read are skipped with the reason, and existing folders are never overwritten.
 * **Live Log Tailing:** `benchops logs` streams `frappe.log`, `web.error.log`, and/or `worker.error.log` from the bench in real time, over either transport.
 * **Safe Ad-Hoc Execution:** `benchops execute` runs a single whitelisted Python method via `bench execute` — no interactive shell is ever opened on the target instance.
 
@@ -270,6 +271,80 @@ benchops execute staging --site demo.local frappe.client.set_value \
 * If the remote command fails, the remote Python traceback is printed and `benchops` exits with the same non-zero status code `bench execute` did — safe to use in scripts that check the exit code.
 * There is deliberately no `benchops shell`/`benchops ssh` command. `execute` is the sanctioned way to run something on a site; it runs exactly one bounded, non-interactive command per invocation and nothing more.
 
+## Bulk Cloning a Project
+
+A *project* is a named group of repositories you clone together — for example every app of one ERP implementation, so a new bench or a new teammate is set up with one command.
+
+### 1. Save a token for each private git host
+
+```bash
+benchops git login gitlab.akwad.qa --provider gitlab     # prompts for the token (hidden)
+echo "$TOKEN" | benchops git login github.com --token-stdin
+benchops git whoami gitlab.akwad.qa                      # user, scopes, expiry
+```
+
+Tokens are verified before they are saved and live in the system keyring (service `benchops-git`, separate from server passwords). On a headless host without a keyring, set `BENCHOPS_GIT_TOKEN_<HOST>` instead, e.g. `BENCHOPS_GIT_TOKEN_GITLAB_AKWAD_QA`. A token is never put in a URL, a command line or `.git/config`: git receives it as an HTTP header for that host only, over HTTPS only. Public repositories need no token; with `--protocol ssh` your SSH keys clone and the token is used only to check access.
+
+Required token permissions: GitHub `repo` (classic) or *Contents: read* (fine-grained); GitLab `read_api` + `read_repository`; Gitea *repository: read*.
+
+### 2. Define the project
+
+From options:
+
+```bash
+benchops project add akwad-erp --host gitlab.akwad.qa --branch develop \
+    --repo erp-team/akwad_core --repo erp-team/akwad_hr \
+    --repo https://github.com/frappe/hrms
+benchops project add akwad-all --host gitlab.akwad.qa --provider gitlab --group erp-team --match 'akwad_*'
+```
+
+Or from a manifest your team commits (no secrets in it):
+
+```toml
+# akwad-erp.toml
+host = "gitlab.akwad.qa"
+protocol = "https"        # or "ssh"
+branch = "develop"        # optional default for every repo
+group = "erp-team"        # optional: also discover repos from this group
+match = "akwad_*"         # optional: only discovered repos matching this glob
+
+[[repos]]
+path = "erp-team/akwad_core"
+
+[[repos]]
+url = "https://github.com/frappe/hrms"
+branch = "version-15"
+dir = "hrms"              # folder name (default: the repo name)
+min_access = "write"      # skip it for people who can only read
+```
+
+```bash
+benchops project add akwad-erp --manifest akwad-erp.toml   # or clone it directly:
+benchops clone akwad-erp.toml --into ~/frappe-bench/apps
+```
+
+### 3. Clone
+
+```bash
+benchops clone akwad-erp --into ~/frappe-bench/apps --dry-run   # plan + your access, nothing written
+benchops clone akwad-erp --into ~/frappe-bench/apps -j 6
+```
+
+Before anything is written, BenchOps checks every token, asks each host what your role is on each repository, confirms with `git ls-remote` that git itself is allowed in and that the branch exists, and inspects every target folder. The plan lists each repository's branch, your access and the action:
+
+| Action | When |
+|---|---|
+| `clone` | Folder is missing or empty |
+| `skip` | Already cloned from the same repository (any protocol), or your role is below the repo's `min_access` |
+| `update` | Already cloned and `--update` given: fetch, then fast-forward only if the work tree is clean and the branch hasn't diverged |
+| `no access` | The host says you can't read it (private repos usually look "not found"), or git refused the token — not counted as a failure |
+| `conflict` | Folder holds a different repository, is a non-empty non-git folder or a file, or two repositories would land in the same folder (set `dir` on one) |
+| `error` | Branch doesn't exist, or the host is unreachable |
+
+Conflicts are never resolved by overwriting. Each repository is cloned into a temporary folder and renamed into place only when complete, so an interrupted or failed clone leaves nothing half-written, and a folder that appears while cloning is left untouched. A lock file stops two `benchops clone` runs from writing into the same directory at once (a lock left by a crashed run on the same machine is taken over automatically). One repository failing never stops the others; transient network errors are retried twice. The exit code is non-zero if anything failed or conflicted, and `benchops clone akwad-erp --retry-failed` redoes only those.
+
+Useful options: `--only core,hr` / `--skip 'legacy_*'` (folder, path or glob), `--branch version-15`, `--depth 1` (shallow), `--partial` (full history, file contents fetched on demand — much faster for large repos; sets up the credential helper so later fetches can authenticate), `--persist-credentials` (later `git pull` uses the stored token through `benchops git credential`, still nothing in plain text), `--protocol ssh`, `--yes`.
+
 ## CLI Command Reference
 
 ### Global Commands
@@ -285,6 +360,8 @@ benchops execute staging --site demo.local frappe.client.set_value \
 * `benchops logs <server_alias> [--type frappe.log|web.error.log|worker.error.log]`: Tails bench logs in real time (Ctrl+C to stop).
 * `benchops execute <server_alias> --site <site_name> <method> [--args <json>] [--kwargs <json>]`: Runs a single Python method via `bench execute` — no interactive shell.
 
+* `benchops clone <project|manifest.toml> [--into DIR] [-j N] [--dry-run] [--update] [--retry-failed] [--only ...] [--skip ...]`: Clones a project's repositories in parallel after checking your access — see [Bulk Cloning a Project](#bulk-cloning-a-project).
+
 ### Server Management (`benchops server`)
 
 * `add [--connection-type ssh|ssm] [--instance-id ...] [--aws-profile ...] [--aws-region ...]`: Interactively add or update a remote server profile.
@@ -298,6 +375,18 @@ benchops execute staging --site demo.local frappe.client.set_value \
 ### Trust Bootstrapping (`benchops auth`)
 
 * `setup-keys <alias>`: Generate/reuse the BenchOps SSH keypair and install it on a `connection_type=ssm` server via an SSM RunCommand — see [Bootstrapping SSH Trust via AWS SSM](#bootstrapping-ssh-trust-via-aws-ssm).
+
+### Git Hosts (`benchops git`)
+
+* `login <host> [--provider github|gitlab|gitea|generic] [--api-url ...] [--username ...] [--token-stdin]`: Verify a token and save it to the keyring.
+* `whoami <host>`: Show the token's user, scopes and expiry.
+* `hosts`: List git hosts and where each token comes from (keyring / env).
+* `logout <host>`: Delete the token and host settings.
+
+### Clone Projects (`benchops project`)
+
+* `add <name> [--manifest file.toml | --host ... --repo ... --group ... --match ... --branch ... --protocol ...] [--replace]`: Define a project.
+* `list` / `show <name>` / `remove <name>`: Inspect or delete projects (removing never touches cloned folders).
 
 ## Testing Your Changes
 
