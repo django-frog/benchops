@@ -200,3 +200,15 @@ def test_other_commands_point_out_a_stale_skill(claude_home, monkeypatch):
     assert result.exit_code == 0
     assert "skill is from 0.21.0" in " ".join(result.stderr.split())
     assert "skill is from" not in result.stdout
+
+
+@pytest.mark.skipif(platform.system() == "Windows", reason="POSIX file modes")
+def test_upgrade_fixes_the_0600_mode_of_a_0_22_0_copy(claude_home):
+    path, _ = skill.install("0.22.0")
+    os.chmod(path, 0o600)
+
+    skill.install("0.23.0")
+
+    umask = os.umask(0)
+    os.umask(umask)
+    assert path.stat().st_mode & 0o777 == 0o666 & ~umask

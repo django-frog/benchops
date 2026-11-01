@@ -125,10 +125,11 @@ def _default_mode() -> int:
     return 0o666 & ~umask
 
 
-def atomic_write(path: Path, text: str) -> None:
-    """Write UTF-8 with LF endings atomically, keeping an existing file's mode."""
+def atomic_write(path: Path, text: str, keep_mode: bool = True) -> None:
+    """Write UTF-8 with LF endings atomically. Keeps an existing file's mode
+    unless `keep_mode` is False; new files get the usual umask-based mode."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if path.exists() else _default_mode()
+    mode = path.stat().st_mode & 0o777 if keep_mode and path.exists() else _default_mode()
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as handle:

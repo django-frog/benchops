@@ -121,7 +121,8 @@ def install(version: str, force: bool = False) -> tuple[Path, str | None]:
         if found.symlink:
             _remove_link(found)
         replaced = found.version or "an unmanaged copy"
-    atomic_write(path, stamp(bundled_skill(), version))
+    # Not keep_mode: a copy written by 0.22.0 was mode 0600 by mistake.
+    atomic_write(path, stamp(bundled_skill(), version), keep_mode=False)
     return path, replaced
 
 
