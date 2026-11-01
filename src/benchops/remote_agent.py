@@ -697,15 +697,20 @@ def cmd_release(args):
     app_dir = os.path.join("apps", args["app"])
     if not os.path.isdir(os.path.join(app_dir, ".git")):
         return {}
-    shutil.rmtree(os.path.join(state_dir(app_dir), "incoming"), ignore_errors=True)
-    git(app_dir, "update-ref", "-d", INCOMING_REF, check=False)
     if args.get("package"):
         try:
             os.remove(args["package"])
         except FileNotFoundError:
             pass
+    # The incoming state is shared: while another deploy holds the lock it is
+    # theirs, so a deploy that was refused (or whose lock was broken) must
+    # leave it alone.
     lock = read_json(lock_path(app_dir))
-    if lock and lock.get("token") == args["token"]:
+    if lock and lock.get("token") != args["token"]:
+        return {}
+    shutil.rmtree(os.path.join(state_dir(app_dir), "incoming"), ignore_errors=True)
+    git(app_dir, "update-ref", "-d", INCOMING_REF, check=False)
+    if lock:
         os.remove(lock_path(app_dir))
     return {}
 

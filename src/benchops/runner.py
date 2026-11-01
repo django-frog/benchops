@@ -9,13 +9,10 @@ decide how to execute them safely for its own transport.
 
 from __future__ import annotations
 
-import json
 import platform
 import shlex
 import shutil
-import socket
 import subprocess
-import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from types import TracebackType
@@ -23,9 +20,11 @@ from types import TracebackType
 import paramiko
 from fabric import Connection
 
-SSM_TUNNEL_READY_TIMEOUT_SECONDS = 15
-SSM_TUNNEL_POLL_INTERVAL_SECONDS = 0.3
-SSM_TUNNEL_TERMINATE_TIMEOUT_SECONDS = 5
+from benchops.ssm import SsmError, SsmTunnel, session_for
+
+# Keeps long, silent remote commands (bench migrate) from being cut off by
+# NAT/firewall idle timeouts or the SSM session's idle timeout.
+SSH_KEEPALIVE_SECONDS = 30
 
 
 class BenchOpsConnectionError(Exception):
@@ -168,102 +167,6 @@ class LocalRunner(Runner):
             raise BenchOpsConnectionError(f"Failed to copy '{local_path}' to '{remote_path}': {exc}") from exc
 
 
-def _require_ssm_binaries() -> None:
-    """Fail fast, with an actionable message, if the SSM tunnel's external
-    dependencies aren't resolvable on PATH — rather than letting a bare
-    FileNotFoundError surface from deep inside subprocess.Popen (which is
-    especially unhelpful on Windows, where a missing .exe/.cmd shim and a
-    missing binary look identical from the caller's side).
-    """
-    missing = [name for name in ("aws", "session-manager-plugin") if shutil.which(name) is None]
-    if missing:
-        raise BenchOpsConnectionError(
-            "Missing required tool(s) for SSM connections: " + ", ".join(missing) + ". "
-            "Install the AWS CLI v2 and the Session Manager plugin, and ensure both are on PATH."
-        )
-
-
-def _find_free_local_port() -> int:
-    """Ask the OS for an ephemeral, currently-unused loopback port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
-def _build_ssm_port_forward_command(
-    instance_id: str,
-    remote_port: int,
-    local_port: int,
-    aws_profile: str | None,
-    aws_region: str | None,
-) -> list[str]:
-    """Build the argv for an `aws ssm start-session` port-forwarding session
-    from a local port to `remote_port` on the target instance itself.
-
-    Uses AWS-StartPortForwardingSession, not the *ToRemoteHost variant: the
-    latter forwards through the target instance to a *different* host/service
-    (e.g. an RDS endpoint reached via a bastion) and needs a "host" parameter
-    that doesn't apply here — we're forwarding to sshd on the same instance
-    named by --target, which is exactly what the plain document is for.
-    """
-    parts = [
-        "aws", "ssm", "start-session",
-        "--target", instance_id,
-        "--document-name", "AWS-StartPortForwardingSession",
-        "--parameters", json.dumps({
-            "portNumber": [str(remote_port)],
-            "localPortNumber": [str(local_port)],
-        }),
-    ]
-    if aws_profile:
-        parts += ["--profile", aws_profile]
-    if aws_region:
-        parts += ["--region", aws_region]
-    return parts
-
-
-def _wait_for_tunnel(process: subprocess.Popen, port: int) -> None:
-    """Block until the local end of the port-forwarding tunnel is accepting
-    connections, or raise with the AWS CLI's own diagnostic if it exits
-    early (missing IAM permission, offline SSM agent, bad instance ID, ...).
-    """
-    deadline = time.monotonic() + SSM_TUNNEL_READY_TIMEOUT_SECONDS
-    last_error: OSError | None = None
-
-    while time.monotonic() < deadline:
-        exit_code = process.poll()
-        if exit_code is not None:
-            stderr = (process.stderr.read() if process.stderr else "") or ""
-            raise BenchOpsConnectionError(
-                f"The SSM port-forwarding session exited early (code {exit_code}): {stderr.strip()}"
-            )
-
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=1):
-                return
-        except OSError as exc:
-            last_error = exc
-            time.sleep(SSM_TUNNEL_POLL_INTERVAL_SECONDS)
-
-    raise BenchOpsConnectionError(
-        f"Timed out waiting for the SSM tunnel on 127.0.0.1:{port} to become ready: {last_error}"
-    )
-
-
-def _terminate_process(process: subprocess.Popen) -> None:
-    """Cross-platform process teardown: Popen.terminate()/.kill() dispatch to
-    SIGTERM/TerminateProcess correctly per OS without any extra code here.
-    """
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=SSM_TUNNEL_TERMINATE_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=SSM_TUNNEL_TERMINATE_TIMEOUT_SECONDS)
-
-
 class RemoteRunner(Runner):
     """Runs commands on a remote host over SSH, streaming output in real-time.
 
@@ -290,7 +193,7 @@ class RemoteRunner(Runner):
         self.port = port
         self.user = user
         self.display_target = display_target or f"{host}:{port}"
-        self._tunnel_process: subprocess.Popen | None = None
+        self._tunnel: SsmTunnel | None = None
 
         connect_kwargs: dict = {}
         if password:
@@ -308,59 +211,42 @@ class RemoteRunner(Runner):
     @classmethod
     def via_ssm(
         cls,
-        instance_id: str,
-        user: str,
-        port: int = 22,
+        server_config: dict,
         password: str | None = None,
         key_path: str | None = None,
-        aws_profile: str | None = None,
-        aws_region: str | None = None,
     ) -> "RemoteRunner":
-        """Build a RemoteRunner whose SSH traffic rides a local TCP port that
-        `aws ssm start-session` forwards to `port` on the target instance."""
-        _require_ssm_binaries()
-
-        local_port = _find_free_local_port()
-        argv = _build_ssm_port_forward_command(instance_id, port, local_port, aws_profile, aws_region)
-
+        """Build a RemoteRunner whose SSH traffic rides a Session Manager
+        port-forwarding tunnel to the server's sshd port on its instance."""
+        instance_id = server_config["instance_id"]
         try:
-            tunnel_process = subprocess.Popen(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except OSError as exc:
-            raise BenchOpsConnectionError(
-                f"Could not launch the AWS CLI for the SSM tunnel to '{instance_id}': {exc}"
-            ) from exc
-
-        try:
-            _wait_for_tunnel(tunnel_process, local_port)
-        except BenchOpsConnectionError:
-            _terminate_process(tunnel_process)
-            raise
+            tunnel = SsmTunnel(session_for(server_config), instance_id, int(server_config.get("port", 22))).open()
+        except SsmError as exc:
+            raise BenchOpsConnectionError(str(exc)) from exc
 
         runner = cls(
             host="127.0.0.1",
-            port=local_port,
-            user=user,
+            port=tunnel.local_port,
+            user=server_config["user"],
             password=password,
             key_path=key_path,
-            display_target=f"{instance_id} (via SSM tunnel on 127.0.0.1:{local_port})",
+            display_target=f"{instance_id} (via SSM)",
         )
-        runner._tunnel_process = tunnel_process
+        runner._tunnel = tunnel
         return runner
 
     def _connection_error(self, action: str, exc: Exception) -> BenchOpsConnectionError:
         detail = ""
-        if self._tunnel_process is not None and self._tunnel_process.poll() is not None:
-            stderr = (self._tunnel_process.stderr.read() if self._tunnel_process.stderr else "") or ""
-            if stderr.strip():
-                detail = f" AWS CLI reported: {stderr.strip()}"
+        if self._tunnel is not None and not self._tunnel.is_alive():
+            detail = f" The SSM tunnel closed: {self._tunnel.output() or 'no output'}"
         return BenchOpsConnectionError(
             f"Failed to {action} on {self.user}@{self.display_target}: {exc}.{detail}"
         )
+
+    def _ensure_open(self) -> None:
+        """Connect on first use and turn on SSH keepalives."""
+        if not self.connection.is_connected:
+            self.connection.open()
+            self.connection.transport.set_keepalive(SSH_KEEPALIVE_SECONDS)
 
     def run(self, command: str, cwd: str | None = None, interactive: bool = False) -> None:
         """Run a command on the remote host, streaming output to the terminal.
@@ -377,6 +263,7 @@ class RemoteRunner(Runner):
         """
         full_command = f"cd {shlex.quote(cwd)} && {command}" if cwd else command
         try:
+            self._ensure_open()
             self.connection.run(full_command, hide=False, pty=interactive, warn=interactive)
         except (paramiko.ssh_exception.SSHException, OSError) as exc:
             raise self._connection_error("connect", exc) from exc
@@ -386,6 +273,7 @@ class RemoteRunner(Runner):
         without echoing it to the local terminal."""
         full_command = f"cd {shlex.quote(cwd)} && {command}" if cwd else command
         try:
+            self._ensure_open()
             result = self.connection.run(full_command, hide=True, warn=True)
         except (paramiko.ssh_exception.SSHException, OSError) as exc:
             raise self._connection_error("connect", exc) from exc
@@ -397,6 +285,7 @@ class RemoteRunner(Runner):
     def put(self, local_path: str, remote_path: str) -> None:
         """Transfer a local file to the remote host over SFTP."""
         try:
+            self._ensure_open()
             self.connection.put(local_path, remote_path)
         except (paramiko.ssh_exception.SSHException, OSError) as exc:
             raise self._connection_error("transfer a file", exc) from exc
@@ -404,5 +293,5 @@ class RemoteRunner(Runner):
     def close(self) -> None:
         """Close the SSH connection and, if tunneled, terminate the SSM session."""
         self.connection.close()
-        if self._tunnel_process is not None:
-            _terminate_process(self._tunnel_process)
+        if self._tunnel is not None:
+            self._tunnel.close()

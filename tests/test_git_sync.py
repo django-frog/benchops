@@ -452,6 +452,22 @@ def test_held_lock_blocks_until_broken(benches):
     assert not lock_file(remote).exists()
 
 
+def test_blocked_deploy_leaves_the_lock_holders_incoming_state_alone(benches):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    state = rapp / ".git" / "benchops"
+    (state / "incoming").mkdir(parents=True)
+    (state / "incoming" / "theirs.py").write_text("in flight\n")
+    lock_file(remote).write_text(json.dumps({"token": "other", "owner": "ali@laptop", "started": "earlier"}))
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", "-A")
+
+    with pytest.raises(typer.Exit):
+        deploy(remote)
+    assert (state / "incoming" / "theirs.py").is_file()
+    assert lock_file(remote).exists()
+
+
 def test_lock_taken_over_mid_deploy_applies_nothing(benches, monkeypatch):
     local, remote = benches
     app, rapp = local / "apps" / APP, remote / "apps" / APP

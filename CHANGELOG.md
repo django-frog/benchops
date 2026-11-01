@@ -5,6 +5,23 @@ version, whether a newer one is available, and what changed.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-01
+
+### Added
+- `benchops server check <alias>`: tests the connection step by step — Session Manager plugin, AWS credentials (shows the identity), SSM registration and agent status, the port-forwarding session, SSH login and the bench directory — and says what to fix at the step that fails, including the exact IAM permission AWS refused.
+- `benchops server add --connection-type ssm` without `--instance-id` lists the instances registered with SSM (name, platform, agent status) to pick from, and no longer asks for a host.
+- aws-vault support for SSM and S3 backup sources: under `aws-vault exec` the injected credentials are used even when the server names an `aws_profile`; outside it, a profile without credentials of its own gets them from `aws-vault export`.
+
+### Changed
+- SSM connections no longer need the AWS CLI, only the Session Manager plugin: BenchOps starts the session itself and terminates it when the command finishes. Previously the plugin could be left running and the session open until its idle timeout.
+- SSH connections send keepalives, so long silent remote commands (e.g. `bench migrate`) are not cut off by idle timeouts.
+- AWS errors (access denied, agent offline, unknown instance, expired credentials) are explained with the fix instead of being shown raw.
+
+### Fixed
+- A deploy refused because another deploy held the lock deleted that deploy's in-flight state on the server, making it fail (or half-apply) when confirmed.
+- Re-running `server add` for an existing server dropped its hooks and private key.
+- `auth setup-keys` failed for users whose primary group is not named after them, and on Debian/Ubuntu, where `/bin/sh` has no `pipefail`.
+
 ## [0.19.0] - 2026-10-20
 
 ### Added

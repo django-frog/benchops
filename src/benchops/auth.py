@@ -4,7 +4,6 @@ import shlex
 import time
 from pathlib import Path
 
-import boto3
 import botocore.exceptions
 import keyring
 import keyring.errors
@@ -13,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from benchops.runner import BenchOpsConnectionError
 from benchops.security import secure_file
+from benchops.ssm import SsmError, explain_client_error, session_for
 
 SERVICE_NAME = "benchops"
 
@@ -93,49 +93,34 @@ class AuthManager:
 
         return private_path, public_path
 
-    def provision_public_key(
-        self,
-        instance_id: str,
-        remote_user: str,
-        public_key: str,
-        aws_profile: str | None = None,
-        aws_region: str | None = None,
-    ) -> None:
-        """Append `public_key` to `remote_user`'s authorized_keys on the given
+    def provision_public_key(self, server_config: dict, public_key: str) -> None:
+        """Append `public_key` to the server user's authorized_keys on its
         EC2 instance via an SSM RunCommand (AWS-RunShellScript).
 
         Raises BenchOpsConnectionError for anything that prevents trust from
         being established: missing IAM permissions, an offline/unregistered
         SSM agent, or a failing remote script.
         """
+        instance_id = server_config["instance_id"]
         try:
-            session = boto3.Session(profile_name=aws_profile, region_name=aws_region)
-            ssm = session.client("ssm")
+            ssm = session_for(server_config).client("ssm")
+        except SsmError as exc:
+            raise BenchOpsConnectionError(str(exc)) from exc
         except botocore.exceptions.BotoCoreError as exc:
-            raise BenchOpsConnectionError(f"Could not create an AWS SSM client: {exc}") from exc
+            raise BenchOpsConnectionError(explain_client_error(exc, instance_id, "ssm:SendCommand")) from exc
 
-        script = _build_authorized_keys_script(remote_user, public_key)
+        script = _build_authorized_keys_script(server_config["user"], public_key)
 
         try:
             response = ssm.send_command(
                 InstanceIds=[instance_id],
                 DocumentName="AWS-RunShellScript",
+                Comment="benchops auth setup-keys",
                 Parameters={"commands": script.splitlines()},
                 TimeoutSeconds=SSM_COMMAND_TIMEOUT_SECONDS,
             )
-        except botocore.exceptions.ClientError as exc:
-            error_code = exc.response.get("Error", {}).get("Code", "")
-            if error_code in ("InvalidInstanceId", "TargetNotConnected"):
-                raise BenchOpsConnectionError(
-                    f"Instance '{instance_id}' is not reachable via SSM (agent offline, "
-                    f"unregistered, or not permitted): {exc}"
-                ) from exc
-            raise BenchOpsConnectionError(
-                f"AWS rejected the SSM command for '{instance_id}' (check IAM permissions "
-                f"for ssm:SendCommand): {exc}"
-            ) from exc
-        except botocore.exceptions.BotoCoreError as exc:
-            raise BenchOpsConnectionError(f"Failed to reach AWS SSM: {exc}") from exc
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+            raise BenchOpsConnectionError(explain_client_error(exc, instance_id, "ssm:SendCommand")) from exc
 
         command_id = response["Command"]["CommandId"]
         self._await_command_success(ssm, command_id, instance_id)
@@ -152,7 +137,9 @@ class AuthManager:
                 if exc.response.get("Error", {}).get("Code") == "InvocationDoesNotExist":
                     time.sleep(SSM_POLL_INTERVAL_SECONDS)
                     continue
-                raise BenchOpsConnectionError(f"Failed to check SSM command status: {exc}") from exc
+                raise BenchOpsConnectionError(
+                    explain_client_error(exc, instance_id, "ssm:GetCommandInvocation")
+                ) from exc
 
             last_status = invocation["Status"]
             if last_status == "Success":
@@ -175,11 +162,13 @@ def _build_authorized_keys_script(remote_user: str, public_key: str) -> str:
     """Build the remote shell script that installs a public key with strict,
     correctly-owned permissions. Runs as root (the SSM agent's default user),
     so paths are resolved via getent rather than relying on tilde expansion.
+    AWS-RunShellScript runs it with /bin/sh, which is dash on Debian/Ubuntu,
+    so it sticks to POSIX sh (no pipefail).
     """
     user = shlex.quote(remote_user)
     key_line = shlex.quote(public_key.strip())
     return f"""
-set -euo pipefail
+set -eu
 TARGET_USER={user}
 HOME_DIR=$(getent passwd "$TARGET_USER" | cut -d: -f6)
 if [ -z "$HOME_DIR" ]; then
@@ -188,9 +177,10 @@ if [ -z "$HOME_DIR" ]; then
 fi
 SSH_DIR="$HOME_DIR/.ssh"
 AUTH_KEYS="$SSH_DIR/authorized_keys"
-install -d -m 700 -o "$TARGET_USER" -g "$TARGET_USER" "$SSH_DIR"
+TARGET_GROUP=$(id -gn "$TARGET_USER")
+install -d -m 700 -o "$TARGET_USER" -g "$TARGET_GROUP" "$SSH_DIR"
 touch "$AUTH_KEYS"
-chown "$TARGET_USER":"$TARGET_USER" "$AUTH_KEYS"
+chown "$TARGET_USER":"$TARGET_GROUP" "$AUTH_KEYS"
 chmod 600 "$AUTH_KEYS"
 grep -qxF {key_line} "$AUTH_KEYS" || echo {key_line} >> "$AUTH_KEYS"
 command -v restorecon >/dev/null 2>&1 && restorecon -R "$SSH_DIR" || true

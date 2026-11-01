@@ -20,6 +20,8 @@ import boto3.exceptions
 import botocore.config
 import botocore.exceptions
 
+from benchops.awscreds import AwsCredentialsError, aws_session
+
 DEFAULT_URL_EXPIRY_SECONDS = 3600
 
 _KEY_RE = re.compile(
@@ -148,7 +150,7 @@ class S3Backups:
         endpoint_url = source.get("endpoint_url")
         region = source.get("aws_region")
         try:
-            session = boto3.Session(profile_name=source.get("aws_profile"), region_name=region)
+            session = aws_session(source.get("aws_profile"), region)
             config = botocore.config.Config(signature_version="s3v4")
             client = session.client("s3", endpoint_url=endpoint_url, config=config)
             # Presigned URLs only work when signed for the bucket's own region,
@@ -160,6 +162,8 @@ class S3Backups:
                     raise BackupSourceError(f"{exc} Pass --aws-region to skip looking up the bucket's region.") from exc
                 bucket_region = location.get("LocationConstraint") or "us-east-1"
                 client = session.client("s3", region_name=bucket_region, config=config)
+        except AwsCredentialsError as exc:
+            raise BackupSourceError(str(exc)) from exc
         except botocore.exceptions.BotoCoreError as exc:
             raise BackupSourceError(f"Could not create an S3 client: {exc}") from exc
         return client

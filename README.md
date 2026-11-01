@@ -13,6 +13,7 @@ A robust Command Line Interface (CLI) tool designed to streamline and synchroniz
 * **Secure Credential Management:** Store authentication methods locally, supporting both SSH private keys and passwords securely.
 * **Zero-Trust Access via AWS SSM:** Connect to EC2 instances with port 22 closed entirely, by tunneling SSH through an AWS Systems Manager Session Manager port-forwarding session (`connection_type = "ssm"`).
 * **SSM-Bootstrapped Trust:** `benchops auth setup-keys` generates a BenchOps-managed ed25519 keypair and installs the public half onto the instance via an SSM RunCommand — no pre-existing SSH access required.
+* **aws-vault Friendly:** Point a server at an aws-vault profile, or run under `aws-vault exec`; `benchops server check` diagnoses the whole SSM path step by step.
 * **Cross-Platform by Design:** Works natively on Linux, macOS, and Windows (PowerShell/cmd.exe) — no WSL required. Local hooks, file permissions, and the SSM tunnel all dispatch to OS-appropriate implementations under the hood.
 * **Bulk Cloning with Access Checks:** `benchops clone <project>` clones every repository of a project in parallel — public or on a private GitHub, GitLab, Gitea or plain git host. Your token is checked first and each repository shows your role (read / write / admin); repositories you can't read are skipped with the reason, and existing folders are never overwritten.
 * **Restore Sites from S3:** `benchops restore` restores a site from the backups Frappe's S3 Backup Settings upload — on a server or on your local bench, replacing a site (after a safety backup) or creating a new one. A server downloads straight from S3 through short-lived presigned URLs, so it needs no AWS credentials of its own.
@@ -60,18 +61,35 @@ benchops server add \
 ```bash
 benchops server add \
   --alias staging \
-  --host 3.7.212.100 \
-  --port 22 \
   --user akwad \
   --bench-path /home/akwad/dev-bench-03 \
   --connection-type ssm \
-  --instance-id i-0123456789abcdef0 \
   --aws-region me-south-1 \
   --aws-profile my-aws-profile
 
 ```
 
-`--aws-profile`/`--aws-region` are optional — omit them to use your default AWS CLI credentials/region. `--host`/`--port` are still recorded for reference; the SSM path only actually uses `--instance-id` and `--port` (as the sshd port on the instance to forward to).
+Leave out `--instance-id` and BenchOps lists the instances registered with SSM (name, platform, agent status) to pick from. `--aws-profile`/`--aws-region` are optional — omit them to use your default AWS credentials/region. `--port` is sshd's port on the instance (default 22); `--host` is only a label for SSM servers.
+
+**aws-vault** works either way: set `--aws-profile` to the aws-vault profile and BenchOps fetches credentials with `aws-vault export` when the profile has none of its own (MFA/passphrase prompts appear in the terminal), or run any command under `aws-vault exec <profile> -- benchops ...`.
+
+Re-running `server add` for an existing alias updates it and keeps its hooks and key — e.g. to move a server from `ssh` to `ssm`.
+
+Then check the whole path end to end — every step says what to fix if it fails:
+
+```bash
+benchops server check staging
+
+```
+
+```
+✓ Session Manager plugin installed — session-manager-plugin 1.2.835.0
+✓ AWS credentials — arn:aws:iam::123456789012:user/you in me-south-1
+✓ Instance registered with SSM — develop.example.com, Red Hat Enterprise Linux 9.7, agent Online
+✓ Port-forwarding session (ssm:StartSession) — 127.0.0.1:41873 → i-0123456789abcdef0:22
+✓ SSH login — akwad@develop.example.com with key ~/.benchops/keys/benchops_ed25519
+✓ Bench directory — /home/akwad/dev-bench-03
+```
 
 ### 3. Set Authentication
 
@@ -102,8 +120,8 @@ This:
 **Prerequisites for this to work:**
 
 * The EC2 instance's IAM role must have the `AmazonSSMManagedInstanceCore` policy (or equivalent) and the SSM Agent must be running and registered — check under **AWS Console → Systems Manager → Fleet Manager** that the instance shows as "Online".
-* Your local AWS credentials/profile need `ssm:SendCommand` and `ssm:GetCommandInvocation` on that instance.
-* The [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and the [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) must both be installed and on `PATH` — required for the `ssm setup-keys` prerequisite check and for every subsequent `connection_type=ssm` connection.
+* Your AWS identity needs, on that instance: `ssm:SendCommand` and `ssm:GetCommandInvocation` (for `setup-keys`), and `ssm:StartSession` — on the instance *and* on the `AWS-StartPortForwardingSession` document — plus `ssm:TerminateSession` (for every connection). `ssm:DescribeInstanceInformation` is optional; it powers the instance picker and the registration step of `server check`.
+* The [Session Manager plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) must be installed and on `PATH`. The AWS CLI is **not** needed: BenchOps starts the session itself and ends it explicitly when the command finishes, so no session is left open until the idle timeout.
 
 ## Managing Hooks and Placeholders
 
@@ -422,7 +440,8 @@ The apps installed in the backup must also be installed on the bench, ideally at
 
 ### Server Management (`benchops server`)
 
-* `add [--connection-type ssh|ssm] [--instance-id ...] [--aws-profile ...] [--aws-region ...]`: Interactively add or update a remote server profile.
+* `add [--connection-type ssh|ssm] [--instance-id ...] [--aws-profile ...] [--aws-region ...]`: Interactively add or update a remote server profile (for `ssm`, pick the instance from a list). Updating keeps the server's hooks and key.
+* `check <alias>`: Test the connection step by step — Session Manager plugin, AWS credentials, SSM registration, port-forwarding session, SSH login, bench directory — and explain what to fix.
 * `list`: Display a table of all configured servers, connection type/instance ID, and hook counts.
 * `set-auth <alias>`: Configure SSH key or password authentication (for `connection_type=ssh`).
 * `remove <alias>`: Delete a server profile and its credentials.
@@ -474,9 +493,9 @@ You should see all tests pass, including:
 
 * `tests/test_local_runner_windows.py` — confirms `LocalRunner` uses `shell=True` with an unmodified command string on Windows (preserving `C:\path\like\this`), and the original `shlex.split` + `shell=False` behavior on Linux/macOS.
 * `tests/test_secure_file_permissions.py` — confirms `secure_file()` calls `chmod` on POSIX and `icacls` on Windows, including its failure paths (missing `icacls`, missing `USERNAME`, non-zero exit).
-* `tests/test_ssm_proxy_windows.py` — confirms `RemoteRunner.via_ssm()` refuses to proceed (and never spawns a process) if `aws` or `session-manager-plugin` isn't on `PATH`.
+* `tests/test_ssm.py` — credentials (aws-vault included), the error explanations, and the tunnel's lifecycle, driven by a fake `session-manager-plugin` run as a real subprocess: readiness, early exit, timeout, and that closing always terminates both the plugin and the SSM session.
 
-To exercise a single file: `uv run pytest tests/test_ssm_proxy_windows.py -v`.
+To exercise a single file: `uv run pytest tests/test_ssm.py -v`.
 
 ### 2. Smoke-test the SSH path (no AWS required)
 
@@ -497,25 +516,17 @@ Confirm `~/.benchops/config.toml` was created with `600` permissions (`ls -l ~/.
 This is the part that actually needs AWS. Prerequisites:
 
 * An EC2 instance with the SSM Agent registered (**Systems Manager → Fleet Manager** shows it "Online") and an IAM role with `AmazonSSMManagedInstanceCore`.
-* Your local AWS credentials configured (`aws configure` or `AWS_PROFILE`) with `ssm:SendCommand`, `ssm:GetCommandInvocation`, and `ssm:StartSession` on that instance.
-* AWS CLI v2 and the Session Manager plugin installed — verify with:
-
-  ```bash
-  aws --version
-  session-manager-plugin
-
-  ```
-
-  If either is missing, `benchops` should now fail immediately with a clear `Missing required tool(s) for SSM connections: ...` error rather than a cryptic traceback — worth deliberately testing by temporarily renaming/hiding one of the binaries.
+* AWS credentials (a profile, aws-vault, or the default chain) with the permissions listed under [Bootstrapping SSH Trust via AWS SSM](#bootstrapping-ssh-trust-via-aws-ssm).
+* The Session Manager plugin installed (`session-manager-plugin --version`).
 
 Then:
 
 ```bash
-uv run benchops server add --alias staging-ssm --host <any-placeholder> --port 22 \
-  --user ec2-user --bench-path /home/ec2-user/frappe-bench \
-  --connection-type ssm --instance-id i-0123456789abcdef0 --aws-region <region>
+uv run benchops server add --alias staging-ssm --connection-type ssm \
+  --user ec2-user --bench-path /home/ec2-user/frappe-bench --aws-region <region>
 
 uv run benchops auth setup-keys staging-ssm
+uv run benchops server check staging-ssm
 
 ```
 
@@ -531,12 +542,13 @@ uv run benchops deploy <your_app> staging-ssm --site <your-site>
 While that's running, in another terminal you can confirm the tunnel is real:
 
 ```bash
-ps aux | grep "ssm start-session"        # Linux/macOS
-Get-Process aws                          # Windows PowerShell
+ps aux | grep session-manager-plugin                 # Linux/macOS
+Get-Process session-manager-plugin                  # Windows PowerShell
+aws ssm describe-sessions --state Active            # the session in SSM
 
 ```
 
-You should see an `aws ssm start-session ... --document-name AWS-StartPortForwardingSession ...` process for the duration of the deploy, and it should disappear once the command finishes (confirming `RemoteRunner.close()` tears it down).
+You should see a `session-manager-plugin` process and an active session for the duration of the deploy; both should be gone once the command finishes (confirming `RemoteRunner.close()` stops the plugin and calls `TerminateSession`).
 
 ### 4. Windows-specific manual checks
 

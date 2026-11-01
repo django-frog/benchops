@@ -69,7 +69,12 @@ class ConfigManager:
         install_remote_commands: list[str] | None = None,
         uninstall_remote_commands: list[str] | None = None,
     ) -> None:
-        """Add or update a server, preserving existing comments and formatting."""
+        """Add or update a server, preserving existing comments and formatting.
+
+        Updating an existing server keeps its hooks and private key unless
+        new ones are passed — re-running `server add` to change the port or
+        switch to SSM must not silently drop them.
+        """
         if connection_type not in VALID_CONNECTION_TYPES:
             raise ValueError(
                 f"Invalid connection_type '{connection_type}'. "
@@ -110,6 +115,12 @@ class ConfigManager:
                 for cmd in commands:
                     array.append(cmd)
                 entry[hook] = array
+
+        existing = doc["servers"].get(alias)
+        if existing is not None:
+            for key, value in existing.items():
+                if key not in entry and (key == "private_key_path" or key.endswith("_commands")):
+                    entry[key] = value
 
         doc["servers"][alias] = entry
         TOMLFile(self.config_path).write(doc)

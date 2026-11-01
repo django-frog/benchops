@@ -2,6 +2,7 @@
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from benchops.auth import AuthManager, KeyringUnavailableError
 from benchops.config import ConfigManager
@@ -90,18 +91,11 @@ class BaseCommand:
                 raise typer.Exit(1)
 
             try:
-                return RemoteRunner.via_ssm(
-                    instance_id=instance_id,
-                    user=server_config["user"],
-                    port=int(server_config.get("port", 22)),
-                    password=password,
-                    key_path=key_path,
-                    aws_profile=server_config.get("aws_profile"),
-                    aws_region=server_config.get("aws_region"),
-                )
+                return RemoteRunner.via_ssm(server_config, password=password, key_path=key_path)
             except BenchOpsConnectionError as exc:
                 console.print(
-                    f"[red]Error: Could not establish an SSM tunnel to '{self.server_alias}': {exc}[/red]"
+                    f"[red]Error: Could not open an SSM tunnel to '{self.server_alias}':[/red] {escape(str(exc))}\n"
+                    f"[dim]Run 'benchops server check {self.server_alias}' to diagnose.[/dim]"
                 )
                 raise typer.Exit(1)
 

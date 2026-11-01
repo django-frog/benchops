@@ -8,11 +8,13 @@ import typer
 from prompt_toolkit import prompt
 from prompt_toolkit.formatted_text import HTML
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from benchops.auth import AuthManager, KeyringUnavailableError
 from benchops.backups import BackupSourceError, S3Backups, human_size
 from benchops.clone import DEFAULT_JOBS, CloneCommand
+from benchops.check import CheckCommand
 from benchops.config import ConfigManager
 from benchops.deploy import DeployCommand
 from benchops.execute import ExecuteCommand
@@ -21,6 +23,7 @@ from benchops.logs import LogsCommand, LogType
 from benchops.projects import load_manifest, validate_project
 from benchops.restore import RestoreCommand
 from benchops.runner import BenchOpsConnectionError
+from benchops.ssm import SsmError, list_managed_instances, session_for
 from benchops.status import StatusCommand
 from benchops.uninstall import UninstallCommand
 from benchops.vcs.credentials import TokenStore, parse_credential_request, token_env_var
@@ -133,28 +136,38 @@ def init() -> None:
 @server_app.command("add")
 def add_server(
     alias: str = typer.Option(..., prompt="Server alias", help="Alias for the server."),
-    host: str = typer.Option(..., prompt="Server host", help="Hostname or IP address."),
-    port: int = typer.Option(22, prompt="SSH port", help="SSH port (default: 22)."),
-    user: str = typer.Option(..., prompt="SSH user", help="SSH username."),
-    bench_path: str = typer.Option(..., prompt="Remote bench path", help="Path to the bench directory on the server."),
     connection_type: ConnectionType = typer.Option(
         ConnectionType.ssh,
         prompt="Connection type",
         help="How benchops should reach this server ('ssh' for direct SSH, 'ssm' for AWS Systems Manager).",
     ),
+    user: str = typer.Option(..., prompt="SSH user", help="SSH username."),
+    bench_path: str = typer.Option(..., prompt="Remote bench path", help="Path to the bench directory on the server."),
+    host: str | None = typer.Option(
+        None, help="Hostname or IP address (asked for ssh; for ssm it is only a label and defaults to the instance)."
+    ),
+    port: int | None = typer.Option(None, help="SSH port (default: 22; for ssm, sshd's port on the instance)."),
     instance_id: str | None = typer.Option(
-        None, help="EC2 instance ID (only used when connection_type is 'ssm')."
+        None, help="EC2 instance ID (ssm only). Omit it to pick from the instances registered with SSM."
     ),
     aws_profile: str | None = typer.Option(
-        None, help="Named AWS CLI profile to use (only used when connection_type is 'ssm')."
+        None, help="AWS profile to use (ssm only). aws-vault profiles work too."
     ),
     aws_region: str | None = typer.Option(
-        None, help="AWS region the instance lives in (only used when connection_type is 'ssm')."
+        None, help="AWS region the instance lives in (ssm only; default: the profile's region)."
     ),
 ) -> None:
-    """Add or update a configured server."""
-    if connection_type == ConnectionType.ssm and not instance_id:
-        instance_id = typer.prompt("EC2 instance ID")
+    """Add or update a configured server. Updating keeps its hooks and key."""
+    if connection_type == ConnectionType.ssh:
+        if not host:
+            host = typer.prompt("Server host")
+        if port is None:
+            port = typer.prompt("SSH port", default=22, type=int)
+    else:
+        if not instance_id:
+            instance_id = _pick_ssm_instance(aws_profile, aws_region)
+        host = host or instance_id
+        port = port or 22
 
     try:
         ConfigManager().add_server(
@@ -172,6 +185,49 @@ def add_server(
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1)
     console.print(f"[green]Server '{alias}' saved to configuration.[/green]")
+
+    server = ConfigManager().get_server(alias) or {}
+    if not server.get("private_key_path"):
+        auth_step = (
+            f"benchops auth setup-keys {alias}"
+            if connection_type == ConnectionType.ssm
+            else f"benchops server set-auth {alias}"
+        )
+        console.print(f"[dim]Next: '{auth_step}', then 'benchops server check {alias}'.[/dim]")
+    else:
+        console.print(f"[dim]Next: 'benchops server check {alias}'.[/dim]")
+
+
+def _pick_ssm_instance(aws_profile: str | None, aws_region: str | None) -> str:
+    """Let the user pick an instance registered with SSM, falling back to
+    typing the ID when the instances can't be listed."""
+    try:
+        instances = list_managed_instances(session_for({"aws_profile": aws_profile, "aws_region": aws_region}))
+    except SsmError as exc:
+        console.print(f"[yellow]Could not list SSM-managed instances: {escape(str(exc))}[/yellow]")
+        return typer.prompt("EC2 instance ID").strip()
+    if not instances:
+        console.print("[yellow]No instances are registered with SSM in this account/region.[/yellow]")
+        return typer.prompt("EC2 instance ID").strip()
+
+    table = Table(title="Instances registered with SSM")
+    table.add_column("#", justify="right")
+    table.add_column("Instance ID", style="bold cyan")
+    table.add_column("Name")
+    table.add_column("Platform")
+    table.add_column("Agent")
+    for number, instance in enumerate(instances, 1):
+        status = "[green]Online[/green]" if instance.ping_status == "Online" else f"[red]{instance.ping_status}[/red]"
+        table.add_row(str(number), instance.instance_id, instance.name, instance.platform, status)
+    console.print(table)
+
+    while True:
+        choice = typer.prompt("Instance (number or ID)").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(instances):
+            return instances[int(choice) - 1].instance_id
+        if choice.startswith(("i-", "mi-")):
+            return choice
+        console.print(f"[red]Enter a number from 1 to {len(instances)}, or an instance ID.[/red]")
 
 
 @server_app.command("list")
@@ -278,6 +334,14 @@ def set_auth(
         console.print(f"[green]Private key path saved for server '{alias}'.[/green]")
 
 
+@server_app.command("check")
+def check_server(
+    alias: str = typer.Argument(..., help="Alias of the configured server."),
+) -> None:
+    """Test the connection to a server step by step (AWS credentials, SSM, SSH login, bench) and explain any failure."""
+    CheckCommand(server_alias=alias).execute()
+
+
 @server_app.command("remove")
 def remove_server(
     alias: str = typer.Argument(..., help="Alias of the configured server to remove."),
@@ -333,21 +397,18 @@ def setup_keys(
     private_path, public_path = auth.generate_keypair()
     console.print(f"[cyan]Using BenchOps keypair: {private_path}[/cyan]")
 
-    console.print(f"[yellow]Installing public key on '{alias}' ({instance_id}) via SSM...[/yellow]")
+    console.print(
+        f"[yellow]Installing public key for '{server_config['user']}' on '{alias}' ({instance_id}) via SSM...[/yellow]"
+    )
     try:
-        auth.provision_public_key(
-            instance_id=instance_id,
-            remote_user=server_config["user"],
-            public_key=public_path.read_text(),
-            aws_profile=server_config.get("aws_profile"),
-            aws_region=server_config.get("aws_region"),
-        )
+        auth.provision_public_key(server_config, public_key=public_path.read_text())
     except BenchOpsConnectionError as exc:
-        console.print(f"[red]Error: Failed to provision the SSH key via SSM: {exc}[/red]")
+        console.print(f"[red]Error: Failed to provision the SSH key via SSM:[/red] {escape(str(exc))}")
         raise typer.Exit(1)
 
     config.update_server_key(alias, str(private_path))
     console.print(f"[green]SSH trust established for '{alias}'. Private key: {private_path}[/green]")
+    console.print(f"[dim]Verify with 'benchops server check {alias}'.[/dim]")
 
 
 @app.command("deploy")
