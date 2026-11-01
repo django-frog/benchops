@@ -22,23 +22,26 @@ class BaseCommand:
         self.site = site
         self.config = ConfigManager()
         self.auth = AuthManager()
+        # What --json prints; commands that support it fill in more.
+        self.report: dict = {}
+
+    def _error(self, message: str, hint: str | None = None) -> None:
+        """Print an error, record it in the report and exit with status 1.
+        `message` is plain text; `hint` is printed dimmed and not recorded."""
+        console.print(f"[red]Error: {escape(message)}[/red]" + (f"\n[dim]{hint}[/dim]" if hint else ""))
+        self.report.update(ok=False, message=f"Error: {message}")
+        raise typer.Exit(1)
 
     def _interpolate_cmd(self, cmd: str) -> str:
         """Replace {site} and {app} placeholders in the command."""
         if "{site}" in cmd:
             if not self.site:
-                console.print(
-                    f"[red]Error: Command '{cmd}' requires a --site argument, but none was provided.[/red]"
-                )
-                raise typer.Exit(1)
+                self._error(f"Command '{cmd}' requires a --site argument, but none was provided.")
             cmd = cmd.replace("{site}", self.site)
 
         if "{app}" in cmd:
             if not self.app_name:
-                console.print(
-                    f"[red]Error: Command '{cmd}' requires an app name, but none was provided.[/red]"
-                )
-                raise typer.Exit(1)
+                self._error(f"Command '{cmd}' requires an app name, but none was provided.")
             cmd = cmd.replace("{app}", self.app_name)
 
         return cmd
@@ -47,8 +50,7 @@ class BaseCommand:
         """Retrieve and validate the server configuration."""
         server_config = self.config.get_server(self.server_alias)
         if server_config is None:
-            console.print(f"[red]Error: Server '{self.server_alias}' not found in configuration.[/red]")
-            raise typer.Exit(1)
+            self._error(f"Server '{self.server_alias}' not found in configuration.")
         return server_config
 
     def _get_remote_runner(self, server_config: dict) -> Runner:
@@ -60,56 +62,46 @@ class BaseCommand:
         """
         connection_type = server_config.get("connection_type", "ssh")
         if connection_type not in VALID_CONNECTION_TYPES:
-            console.print(
-                f"[red]Error: Unknown connection_type '{connection_type}' for '{self.server_alias}'.[/red]"
-            )
-            raise typer.Exit(1)
+            self._error(f"Unknown connection_type '{connection_type}' for '{self.server_alias}'.")
 
         if connection_type in ("ssm", "ssm-ssh") and not server_config.get("instance_id"):
-            console.print(
-                f"[red]Error: Server '{self.server_alias}' has connection_type '{connection_type}' "
-                "but no instance_id configured.[/red]"
+            self._error(
+                f"Server '{self.server_alias}' has connection_type '{connection_type}' but no instance_id configured."
             )
-            raise typer.Exit(1)
 
         if connection_type == "ssm":
             # Authenticated by IAM alone; no SSH credentials involved.
             try:
                 return SsmShellRunner.connect(server_config)
             except BenchOpsConnectionError as exc:
-                console.print(
-                    f"[red]Error: Could not open an SSM session to '{self.server_alias}':[/red] {escape(str(exc))}\n"
-                    f"[dim]Run 'benchops server check {self.server_alias}' to diagnose.[/dim]"
+                self._error(
+                    f"Could not open an SSM session to '{self.server_alias}': {exc}",
+                    hint=f"Run 'benchops server check {self.server_alias}' to diagnose.",
                 )
-                raise typer.Exit(1)
 
         try:
             password = self.auth.get_password(self.server_alias)
         except KeyringUnavailableError as exc:
-            console.print(
-                f"[red]Error: Could not access the system keyring to retrieve credentials "
-                f"for '{self.server_alias}': {exc}[/red]"
+            self._error(
+                f"Could not access the system keyring to retrieve credentials for '{self.server_alias}': {exc}"
             )
-            raise typer.Exit(1)
 
         key_path = server_config.get("private_key_path")
 
         if not password and not key_path:
-            console.print(
-                f"[red]Error: No authentication configured for server '{self.server_alias}'. "
-                "Run 'benchops server set-auth' or 'benchops auth setup-keys' first.[/red]"
+            self._error(
+                f"No authentication configured for server '{self.server_alias}'. "
+                "Run 'benchops server set-auth' or 'benchops auth setup-keys' first."
             )
-            raise typer.Exit(1)
 
         if connection_type == "ssm-ssh":
             try:
                 return RemoteRunner.via_ssm(server_config, password=password, key_path=key_path)
             except BenchOpsConnectionError as exc:
-                console.print(
-                    f"[red]Error: Could not open an SSM tunnel to '{self.server_alias}':[/red] {escape(str(exc))}\n"
-                    f"[dim]Run 'benchops server check {self.server_alias}' to diagnose.[/dim]"
+                self._error(
+                    f"Could not open an SSM tunnel to '{self.server_alias}': {exc}",
+                    hint=f"Run 'benchops server check {self.server_alias}' to diagnose.",
                 )
-                raise typer.Exit(1)
 
         return RemoteRunner(
             host=server_config["host"],

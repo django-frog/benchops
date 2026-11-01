@@ -228,6 +228,38 @@ benchops status basma dev-bench-02 --files  # every file
 
 It shows the server's branch and commit, the last deploy or sync, every pending draft grouped by label and developer (drafts older than 7 days are flagged stale, drafts edited on the server since are marked), drafts your machine has already committed, and hand edits. It's read-only and doesn't take the lock.
 
+**Scripts and AI agents — `--plan-only` and `--json`:**
+
+```bash
+benchops deploy basma dev-bench-02 --site basma.akwad.qa --label TASK-142 --plan-only --json
+benchops deploy basma dev-bench-02 --site basma.akwad.qa --label TASK-142 --yes --skip-build --json
+benchops status basma dev-bench-02 --json
+```
+
+`--plan-only` runs a deploy or sync up to the plan and stops: it builds, uploads and shows the plan, asks nothing, applies nothing, and releases the lock. Review the plan, then apply it with `--yes` — with `--skip-build` if nothing changed since, so the app isn't built twice.
+
+`--json` prints exactly one JSON document on stdout; the plan, progress and hook output go to stderr. It never prompts, so `deploy` and `sync` need `--plan-only` or `--yes` with it. The exit code is unchanged: 0 when the plan was shown, applied or already up to date, 1 otherwise.
+
+```json
+{
+  "schema": 1, "command": "deploy", "ok": true, "outcome": "planned",
+  "message": "Plan only: nothing was applied on the server. Applying it needs --yes --overwrite (1 overlap(s)).",
+  "plan": {
+    "local":  {"branch": "develop", "commit": "9ff3387a1c…"},
+    "server": {"branch": "develop", "commit": "ca733d8515…", "commits_behind": 2},
+    "staged_files": [{"status": "M", "path": "basma/api/service.py"}],
+    "writes":       [{"status": "M", "path": "basma/api/service.py"}],
+    "overlaps":     [{"path": "basma/api/service.py", "reason": "Ali's deployed draft [TASK-150]"}],
+    "suggested_steps": ["bench restart"],
+    "warnings": ["9ff3387a1c is not pushed to any remote yet."],
+    "…": "…"
+  },
+  "result": null
+}
+```
+
+`outcome` is `planned`, `applied`, `up_to_date`, `aborted` (stopped on purpose before anything changed — e.g. an overlap with `--yes`, or a server commit not in your history) or `failed`. After an apply, `result` lists the backups made and `post_remote_hooks` (`ok` or `failed`); a `failed` outcome with `result.applied: true` means staging changed but a later step, such as a hook, failed. `status --json` lists every draft (`path`, `owner`, `name`, `label`, `deployed_at`, `age_days`, `stale`, `edited`), `committed_locally`, `hand_edits`, `lock` and the server's `git_status`.
+
 **Build outputs and SPA frontends.** Build outputs are paths a build regenerates. They are shipped straight from the build and never through git, even if an old build was committed. `<app>/public/dist` is always one. For a frappe-ui/Vite frontend, the `outDir` and `indexHtmlPath` in its `vite.config.*` (at the app root or one level below, e.g. `frontend/`) are detected automatically. To declare them explicitly, or to turn detection off with an empty list, use the app's `pyproject.toml`:
 
 ```toml
@@ -257,6 +289,27 @@ benchops uninstall custom_app staging --site test-16.akwad.qa
 
 ```
 
+## Using BenchOps with Claude Code
+
+BenchOps ships a [Claude Code skill](skills/benchops/SKILL.md) that teaches Claude to deploy, sync and check staging for you: ask "deploy my staged changes to staging for TASK-142" and Claude previews the plan with `--plan-only --json`, summarises it — every overlap with its reason — and applies it with `--yes` only after you agree. It never passes `--overwrite`, `--force` or `--break-lock` on its own, and never stages files you didn't name.
+
+```bash
+benchops skill install     # into ~/.claude/skills/benchops/ (Windows: %USERPROFILE%\.claude\skills\benchops\)
+benchops skill status      # installed? for which version?
+benchops skill uninstall
+```
+
+The skill describes this version's flags and JSON, so run `benchops skill install` again after every upgrade — every command reminds you when the installed skill is from an older version. A copy you edited, made by hand or symlinked is left alone unless you pass `--force`. `$CLAUDE_CONFIG_DIR` is respected.
+
+Then tell Claude where each app deploys, in `CLAUDE.md` at your bench root (or `~/.claude/CLAUDE.md`):
+
+```markdown
+## BenchOps targets
+| App   | Server       | Site            | Default |
+|-------|--------------|-----------------|---------|
+| basma | dev-bench-02 | basma.akwad.qa  | yes     |
+```
+
 ## Operating a Deployed Site
 
 Once a server is registered and authenticated (`server add` + `server set-auth`/`auth setup-keys`), two commands cover the day-to-day operational work that doesn't need a full deploy — checking what's happening in the logs, and running one-off Frappe methods. Both work identically for `ssh`, `ssm` and `ssm-ssh` servers; any SSM session is opened and ended automatically around each command.
@@ -274,7 +327,13 @@ benchops logs staging --type web.error.log
 
 ```
 
-`--type` accepts `frappe.log`, `web.error.log`, or `worker.error.log`. Press **Ctrl+C** to stop — this closes the remote log stream (and ends the SSM session, for SSM servers) rather than leaving anything running on the server.
+To print the last lines and exit instead of following — for scripts, or when Claude checks the logs — pass `--lines` (`-n`):
+
+```bash
+benchops logs staging --type web.error.log --lines 200
+```
+
+`--type` accepts `frappe.log`, `web.error.log`, or `worker.error.log`. Without `--lines`, press **Ctrl+C** to stop — this closes the remote log stream (and ends the SSM session, for SSM servers) rather than leaving anything running on the server.
 
 Log files are read from `<bench_path>/logs/<name>` on the server — the standard location for a Frappe bench — so no extra configuration is needed beyond the server's existing `bench_path`.
 
@@ -436,12 +495,13 @@ The apps installed in the backup must also be installed on the bench, ideally at
 * `benchops init`: Initializes the BenchOps configuration.
 * `benchops --version`: Prints the installed version.
 * `benchops version [--all]`: Shows the installed version, whether a newer one is on PyPI (with the upgrade command), and the release notes for your version (`--all`: every version). Every other command also prints a one-line notice on stderr when a newer version is available — checked at most once a day; set `BENCHOPS_NO_UPDATE_CHECK=1` to turn it off. See [CHANGELOG.md](CHANGELOG.md).
-* `benchops deploy <app_name> <server_alias> [--site <site_name>]`: Deploys your commits and staged changes to a remote server.
-* `benchops sync <app_name> <server_alias> [--site <site_name>]`: Brings the server up to your latest commits; drafts those commits contain become committed.
-* `benchops status <app_name> <server_alias> [--files]`: Shows what the server runs, pending drafts by label and developer, and hand edits.
+* `benchops deploy <app_name> <server_alias> [--site <site_name>] [--label <task>] [--plan-only | --yes] [--json]`: Deploys your commits and staged changes to a remote server. `--plan-only` shows the plan and applies nothing; `--json` prints the outcome and plan as JSON.
+* `benchops sync <app_name> <server_alias> [--site <site_name>] [--plan-only | --yes] [--json]`: Brings the server up to your latest commits; drafts those commits contain become committed.
+* `benchops status <app_name> <server_alias> [--files] [--json]`: Shows what the server runs, pending drafts by label and developer, and hand edits.
 * `benchops install <app_name> <server_alias> --site <site_name>`: Executes the install-remote hooks.
 * `benchops uninstall <app_name> <server_alias> --site <site_name>`: Executes the uninstall-remote hooks.
-* `benchops logs <server_alias> [--type frappe.log|web.error.log|worker.error.log]`: Tails bench logs in real time (Ctrl+C to stop).
+* `benchops logs <server_alias> [--type frappe.log|web.error.log|worker.error.log] [--lines N]`: Tails bench logs in real time (Ctrl+C to stop), or prints the last N lines and exits.
+* `benchops skill install|status|uninstall [--force]`: Installs the Claude Code skill for this version — see [Using BenchOps with Claude Code](#using-benchops-with-claude-code).
 * `benchops execute <server_alias> --site <site_name> <method> [--args <json>] [--kwargs <json>]`: Runs a single Python method via `bench execute` — no interactive shell.
 
 * `benchops restore <source> --site <site> (--server <alias> | --local [--bench PATH]) [--from-site ...] [--at latest|STAMP] [--new-site] [--no-files] [--admin-password ...] [--skip-safety-backup] [--yes]`: Restores a site from an S3 backup — see [Restoring a Site from S3](#restoring-a-site-from-s3).

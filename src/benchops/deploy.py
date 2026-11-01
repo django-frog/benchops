@@ -21,6 +21,8 @@ Pipeline:
   6. remote   pre-remote hooks, apply (backup overlaps, write deploy set,
               move HEAD, build outputs, record), cache clear, post-remote
               hooks; the lock is always released
+  --plan-only stops after step 5 (nothing applied, nothing asked);
+  `report` records the outcome and the plan as data for --json.
 """
 
 import posixpath
@@ -35,6 +37,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from benchops.assets import collect_app_manifests, resolve_bench_path
 from benchops.base import BaseCommand
@@ -174,9 +177,11 @@ class DeployCommand(BaseCommand):
         overwrite: bool = False,
         label: str | None = None,
         sync: bool = False,
+        plan_only: bool = False,
     ) -> None:
         super().__init__(server_alias, app_name, site)
         self.yes = yes
+        self.plan_only = plan_only
         self.force = force
         self.break_lock = break_lock
         self.skip_build = skip_build
@@ -184,6 +189,31 @@ class DeployCommand(BaseCommand):
         self.label = label
         self.sync = sync
         self.verb = "sync" if sync else "deploy"
+        # What happened, for --json: filled in as the pipeline runs.
+        self.report: dict = {
+            "command": self.verb,
+            "app": app_name,
+            "server": server_alias,
+            "site": site,
+            "label": label,
+            "plan_only": plan_only,
+            "ok": False,
+            "outcome": "failed",
+            "message": None,
+            "frontend_unshipped": [],
+            "plan": None,
+            "result": None,
+        }
+
+    def _finish(self, outcome: str, message: str | None = None) -> None:
+        self.report.update(outcome=outcome, message=message, ok=outcome in ("planned", "applied", "up_to_date"))
+
+    def _fail(self, outcome: str, message: str, style: str = "red") -> None:
+        """Report why the pipeline stopped and exit with status 1."""
+        verb = self.verb.capitalize()
+        console.print(f"[{style}]{verb} {'aborted' if outcome == 'aborted' else 'failed'}: {escape(message)}[/{style}]")
+        self._finish(outcome, message)
+        raise typer.Exit(1)
 
     def _resolve_app_dir(self) -> Path:
         """Locate the local application directory."""
@@ -221,6 +251,7 @@ class DeployCommand(BaseCommand):
         risky = unstaged_frontend_changes(local.staged, source_dirs)
         if not risky:
             return "build"
+        self.report["frontend_unshipped"] = risky
         what = "NOT committed" if self.sync else "NOT staged"
         _print_list(
             f"⚠ Frontend files with changes that are {what} (their source won't be shipped, "
@@ -228,8 +259,9 @@ class DeployCommand(BaseCommand):
             risky,
             "bold yellow",
         )
-        if self.yes:
-            console.print("[yellow]Building anyway (--yes); the shipped build includes these changes.[/yellow]")
+        if self.yes or self.plan_only:
+            flag = "--yes" if self.yes else "--plan-only"
+            console.print(f"[yellow]Building anyway ({flag}); the shipped build includes these changes.[/yellow]")
             return "build"
         prompt = "Build anyway, including these uncommitted changes?" if self.sync else (
             "Build anyway, including these unstaged changes?"
@@ -329,11 +361,6 @@ class DeployCommand(BaseCommand):
         _print_list(f"Relabelled to {self.label}", preview["relabel"], "cyan")
         _print_list("Other pending drafts on staging (untouched)", preview["other_drafts"], "dim", by_owner)
         _print_list("Hand edits on staging (untouched)", preview["hand_edits"], "dim")
-        if preview.get("branch_conflict"):
-            warnings.append(
-                f"Branch '{staged.branch}' on the server points at {preview['branch_conflict'][:10]}, which is not "
-                "in your history; it is backed up under refs/benchops/branch-backup/ before moving."
-            )
         if shipped:
             _print_list("Build outputs (replaced on the server)", shipped, "cyan")
         else:
@@ -344,6 +371,33 @@ class DeployCommand(BaseCommand):
         for warning in warnings:
             console.print(f"[bold yellow]⚠ {warning}[/bold yellow]")
         console.rule()
+
+    def _plan_document(self, local: LocalSide, state: dict, preview: dict, warnings: list[str], shipped: list[str]) -> dict:
+        """The plan as data, for --json: the same facts _render_plan prints."""
+        staged, repo = local.staged, local.repo
+        behind = repo.commits_between(state["head"], staged.base)
+        not_shipped = [p for _, p in staged.unstaged] + staged.untracked
+        if staged.commits_only:
+            not_shipped += [p for _, p in staged.staged]
+        changes = lambda items: [{"status": s, "path": p} for s, p in items]
+        owned = lambda items: [{"path": p, "draft": d} for p, d in items]
+        return {
+            "local": {"branch": staged.branch, "commit": staged.base},
+            "server": {"branch": state.get("branch"), "commit": state["head"], "commits_behind": behind},
+            "staged_files": changes(staged.shipped),
+            "not_shipped": sorted(set(not_shipped)),
+            "writes": changes(preview["writes"]),
+            "overlaps": [{"path": p, "reason": r} for p, r in preview["overlaps"]],
+            "replaced_own": preview["replaced_own"],
+            "takeover": owned(preview["takeover"]),
+            "absorbed": owned(preview["absorbed"]),
+            "relabel": preview["relabel"],
+            "other_drafts": owned(preview["other_drafts"]),
+            "hand_edits": preview["hand_edits"],
+            "build_outputs": shipped,
+            "suggested_steps": required_steps(self.app_name, preview["changes"]),
+            "warnings": warnings,
+        }
 
     def _confirm(self, preview: dict) -> None:
         if preview["overlaps"] and not self.overwrite:
@@ -369,11 +423,9 @@ class DeployCommand(BaseCommand):
             remote_head = self._probe_remote_head(server_config) if self.sync else None
             local = self._prepare_local(server_config, remote_head)
         except RemoteAgentError as exc:
-            console.print(f"[red]{self.verb.capitalize()} failed: {self._describe_agent_error(exc)}[/red]")
-            raise typer.Exit(1)
+            self._fail("failed", self._describe_agent_error(exc))
         except (subprocess.CalledProcessError, BenchOpsConnectionError, FileNotFoundError, GitError, BuildError) as exc:
-            console.print(f"[red]{self.verb.capitalize()} failed: {exc}[/red]")
-            raise typer.Exit(1)
+            self._fail("failed", str(exc))
         staged, repo = local.staged, local.repo
 
         with self._get_remote_runner(server_config) as remote_runner:
@@ -437,13 +489,30 @@ class DeployCommand(BaseCommand):
                 )
                 if preview["up_to_date"] and not shipped:
                     what = "" if self.sync else " + your staged files"
-                    console.print(
-                        f"[green]'{app}' on '{self.server_alias}' is already up to date "
-                        f"({staged.branch or 'detached'} @ {staged.base[:10]}{what}).[/green]"
+                    message = (
+                        f"'{app}' on '{self.server_alias}' is already up to date "
+                        f"({staged.branch or 'detached'} @ {staged.base[:10]}{what})."
                     )
+                    console.print(f"[green]{message}[/green]")
+                    self._finish("up_to_date", message)
                     return
 
+                if preview.get("branch_conflict"):
+                    warnings.append(
+                        f"Branch '{staged.branch}' on the server points at {preview['branch_conflict'][:10]}, which "
+                        "is not in your history; it is backed up under refs/benchops/branch-backup/ before moving."
+                    )
+                self.report["plan"] = self._plan_document(local, state, preview, warnings, shipped)
                 self._render_plan(local, state, preview, warnings, shipped)
+                if self.plan_only:
+                    overlaps = len(preview["overlaps"])
+                    message = (
+                        "Plan only: nothing was applied on the server. Applying it needs "
+                        + (f"--yes --overwrite ({overlaps} overlap(s))." if overlaps else "--yes.")
+                    )
+                    console.print(f"[cyan]{message}[/cyan]")
+                    self._finish("planned", message)
+                    return
                 self._confirm(preview)
                 self._run_hooks(remote_runner, "pre_remote_commands", "pre-remote", server_config, bench_path)
 
@@ -467,6 +536,17 @@ class DeployCommand(BaseCommand):
                         "build_digest": local.digest if ship_build else record.get("build_digest"),
                     },
                 )
+                # From here on staging has changed, even if a later step fails.
+                self.report["result"] = {
+                    "applied": True,
+                    "head": staged.base,
+                    "branch": staged.branch,
+                    "backups": result.get("backups", []),
+                    "warnings": result.get("warnings", []),
+                    "drafts_committed": result.get("absorbed", 0) if self.sync else None,
+                    "build_outputs_shipped": bool(result.get("build_outputs")),
+                    "post_remote_hooks": "pending",
+                }
                 for backup in result.get("backups", []):
                     console.print(f"[cyan]Backed up on the server as {backup}.[/cyan]")
                 for warning in result.get("warnings", []):
@@ -482,19 +562,23 @@ class DeployCommand(BaseCommand):
                 if result.get("build_outputs"):
                     self._clear_remote_cache(remote_runner, bench_path)
 
-                self._run_hooks(remote_runner, "post_remote_commands", "post-remote", server_config, bench_path)
+                try:
+                    self._run_hooks(remote_runner, "post_remote_commands", "post-remote", server_config, bench_path)
+                except Exception:
+                    self.report["result"]["post_remote_hooks"] = "failed"
+                    raise
+                self.report["result"]["post_remote_hooks"] = "ok"
                 done = "synced" if self.sync else "deployed"
-                console.print(f"[green]Successfully {done} '{app}' to '{self.server_alias}'.[/green]")
+                message = f"Successfully {done} '{app}' to '{self.server_alias}'."
+                console.print(f"[green]{message}[/green]")
+                self._finish("applied", message)
 
             except DeployAborted as exc:
-                console.print(f"[yellow]{self.verb.capitalize()} aborted: {exc}[/yellow]")
-                raise typer.Exit(1)
+                self._fail("aborted", str(exc), style="yellow")
             except RemoteAgentError as exc:
-                console.print(f"[red]{self.verb.capitalize()} failed: {self._describe_agent_error(exc)}[/red]")
-                raise typer.Exit(1)
+                self._fail("failed", self._describe_agent_error(exc))
             except (subprocess.CalledProcessError, BenchOpsConnectionError, GitError) as exc:
-                console.print(f"[red]{self.verb.capitalize()} failed: {exc}[/red]")
-                raise typer.Exit(1)
+                self._fail("failed", str(exc))
             finally:
                 # Only removes the lock if it carries our token, so a lock held
                 # by someone else's deploy is never released by this one.

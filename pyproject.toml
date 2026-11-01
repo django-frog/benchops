@@ -1,6 +1,6 @@
 [project]
 name = "benchops"
-version = "0.21.1"
+version = "0.22.0"
 description = "A CLI tool to synchronize local Frappe development environments with remote servers."
 readme = "README.md"
 requires-python = ">=3.14.6"
@@ -35,6 +35,7 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel.force-include]
 "CHANGELOG.md" = "benchops/CHANGELOG.md"
+"skills/benchops/SKILL.md" = "benchops/skills/benchops/SKILL.md"
 
 [dependency-groups]
 dev = [

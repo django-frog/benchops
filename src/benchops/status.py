@@ -13,6 +13,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from benchops.base import BaseCommand
 from benchops.gitlocal import GitError, LocalRepo
@@ -47,6 +48,8 @@ class StatusCommand(BaseCommand):
     def __init__(self, server_alias: str, app_name: str, files: bool = False) -> None:
         super().__init__(server_alias=server_alias, app_name=app_name)
         self.files = files
+        # What --json prints; filled in by execute().
+        self.report: dict = {"command": "status", "app": app_name, "server": server_alias, "ok": False, "message": None}
 
     def _local_blobs(self) -> dict[str, str] | None:
         """Files in this machine's HEAD, if the app is checked out here."""
@@ -67,26 +70,68 @@ class StatusCommand(BaseCommand):
             for path in paths:
                 console.print(f"      {path}")
 
-    def execute(self) -> None:
+    def _fail(self, message: str) -> None:
+        console.print(f"[red]{escape(message)}[/red]")
+        self.report.update(ok=False, message=message)
+        raise typer.Exit(1)
+
+    def collect(self) -> dict:
+        """The server's state for this app, as data (what --json prints)."""
         server_config = self._get_server_config()
         try:
             with self._get_remote_runner(server_config) as runner:
                 state = RemoteAgent(runner, server_config["bench_path"]).call("status", app=self.app_name)
         except RemoteAgentError as exc:
-            message = (
-                f"apps/{self.app_name} on the server is not a git repository."
-                if exc.error == "not_repo"
-                else exc.error
+            self._fail(
+                "Error: "
+                + (f"apps/{self.app_name} on the server is not a git repository." if exc.error == "not_repo" else exc.error)
             )
-            console.print(f"[red]Error: {message}[/red]")
-            raise typer.Exit(1)
         except BenchOpsConnectionError as exc:
-            console.print(f"[red]Failed to reach '{self.server_alias}': {exc}[/red]")
-            raise typer.Exit(1)
+            self._fail(f"Failed to reach '{self.server_alias}': {exc}")
 
-        record, lock = state.get("record") or {}, state.get("lock")
+        drafts = []
+        for draft in state.get("drafts", []):
+            days = age_in_days(draft.get("deployed_at"))
+            drafts.append({
+                "path": draft["path"],
+                "owner": draft.get("owner"),
+                "name": draft.get("name") or draft.get("owner"),
+                "label": draft.get("label"),
+                "deployed_at": draft.get("deployed_at"),
+                "age_days": days,
+                "stale": (days or 0) >= STALE_AFTER_DAYS,
+                "edited": draft["edited"],
+                "blob": draft.get("blob"),
+            })
+        local = self._local_blobs()
+        return {
+            "branch": state.get("branch"),
+            "head": state.get("head"),
+            "subject": state.get("subject"),
+            "last_deploy": state.get("record") or None,
+            "lock": state.get("lock"),
+            "drafts": drafts,
+            # None: the app isn't checked out here, so it can't be compared.
+            "committed_locally": None if local is None else [
+                d["path"] for d in drafts if local.get(d["path"]) == d["blob"]
+            ],
+            "hand_edits": state.get("hand_edits", []),
+            "git_status": {
+                "staged": [{"status": c, "path": p} for c, p in state["staged"]],
+                "unstaged": [{"status": c, "path": p} for c, p in state["unstaged"]],
+                "untracked": state["untracked"],
+            },
+        }
+
+    def execute(self) -> None:
+        data = self.collect()
+        self.report.update(ok=True, **data)
+        self.render(data)
+
+    def render(self, data: dict) -> None:
+        record, lock = data["last_deploy"] or {}, data["lock"]
         console.print(f"[bold]{self.server_alias} / {self.app_name}[/bold]")
-        self._line("On", f"{state.get('branch') or '(detached)'} @ {(state.get('head') or '')[:10]}  {state.get('subject') or ''}")
+        self._line("On", f"{data['branch'] or '(detached)'} @ {(data['head'] or '')[:10]}  {data['subject'] or ''}")
         if record:
             staged = record.get("staged")
             what = f", {len(staged)} staged file(s)" if staged is not None else ""
@@ -102,15 +147,15 @@ class StatusCommand(BaseCommand):
         if lock:
             self._line("Deploy lock", f"held by {lock.get('owner')} since {lock.get('started')}", "yellow")
 
-        drafts = state.get("drafts", [])
+        drafts = data["drafts"]
         console.print()
         if drafts:
             console.print("  [bold]Pending drafts (deployed, not committed yet):[/bold]")
             groups = defaultdict(list)
             for draft in drafts:
-                groups[(draft.get("label") or "(no label)", draft.get("name") or draft.get("owner"))].append(draft)
+                groups[(draft["label"] or "(no label)", draft["name"])].append(draft)
             for (label, name), items in sorted(groups.items()):
-                days = max((age_in_days(d.get("deployed_at")) or 0) for d in items)
+                days = max((d["age_days"] or 0) for d in items)
                 stale = days >= STALE_AFTER_DAYS
                 summary = f"{name:<20} {len(items)} file(s)   {describe_age(days)}" + ("   ⚠ stale" if stale else "")
                 self._line(f"  {label}", summary, "yellow" if stale else None)
@@ -118,23 +163,23 @@ class StatusCommand(BaseCommand):
         else:
             self._line("Pending drafts", "none")
 
-        local = self._local_blobs()
-        if local is not None:
-            committed = [d["path"] for d in drafts if local.get(d["path"]) == d["blob"]]
-            if committed:
-                self._line("Committed on your machine", f"{len(committed)} file(s) — run 'benchops sync'", "green")
-                self._paths(committed)
+        committed = data["committed_locally"]
+        if committed:
+            self._line("Committed on your machine", f"{len(committed)} file(s) — run 'benchops sync'", "green")
+            self._paths(committed)
 
         edited = [d["path"] for d in drafts if d["edited"]]
         if edited:
             self._line("Drafts edited on staging since", f"{len(edited)} file(s)", "yellow")
-        hand_edits = state.get("hand_edits", [])
+        hand_edits = data["hand_edits"]
         self._line("Hand edits on staging", f"{len(hand_edits)} file(s)")
         self._paths(hand_edits)
 
+        git_status = data["git_status"]
         self._line(
             "Server git status",
-            f"{len(state['staged'])} staged, {len(state['unstaged'])} not staged, {len(state['untracked'])} untracked",
+            f"{len(git_status['staged'])} staged, {len(git_status['unstaged'])} not staged, "
+            f"{len(git_status['untracked'])} untracked",
             "dim",
         )
         if not self.files and (drafts or hand_edits):

@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from benchops import skill as claude_skill
 from benchops.auth import AuthManager, KeyringUnavailableError
 from benchops.awscreds import available_profiles
 from benchops.backups import BackupSourceError, S3Backups, human_size
@@ -22,6 +23,7 @@ from benchops.config import ConfigManager
 from benchops.deploy import DeployCommand
 from benchops.execute import ExecuteCommand
 from benchops.install import InstallCommand
+from benchops.jsonout import emit, human_output_to_stderr
 from benchops.logs import LogsCommand, LogType
 from benchops.projects import load_manifest, validate_project
 from benchops.restore import RestoreCommand
@@ -89,6 +91,8 @@ backup_source_app = typer.Typer(help="Manage S3 backup sources: the buckets Frap
 backup_app.add_typer(backup_source_app, name="source")
 local_app = typer.Typer(help="Hooks for the bench on this machine (used by 'benchops restore --local').")
 app.add_typer(local_app, name="local")
+skill_app = typer.Typer(help="Install the Claude Code skill that teaches Claude to use benchops.", no_args_is_help=True)
+app.add_typer(skill_app, name="skill")
 
 console = Console()
 err_console = Console(stderr=True)
@@ -114,6 +118,10 @@ def main(
         notice = update_notice()
         if notice:
             err_console.print(f"[yellow]{notice}[/yellow]")
+        if ctx.invoked_subcommand != "skill":
+            notice = claude_skill.stale_notice(installed_version())
+            if notice:
+                err_console.print(f"[yellow]{notice}[/yellow]")
 
 
 @app.command("version")
@@ -459,6 +467,40 @@ def setup_keys(
     console.print(f"[dim]Verify with 'benchops server check {alias}'.[/dim]")
 
 
+def _run(command, as_json: bool) -> None:
+    """Run a command; with --json, its human output goes to stderr and its
+    report is printed to stdout as one JSON document, whatever the outcome."""
+    if not as_json:
+        command.execute()
+        return
+    code = 0
+    with human_output_to_stderr():
+        try:
+            command.execute()
+        except typer.Exit as exc:
+            code = exc.exit_code
+        except Exception as exc:  # report it, then fail as usual
+            command.report.update(ok=False, message=f"Unexpected error: {type(exc).__name__}: {exc}")
+            emit(command.report)
+            raise
+    emit(command.report)
+    if code:
+        raise typer.Exit(code)
+
+
+def _check_non_interactive(yes: bool, plan_only: bool, as_json: bool) -> None:
+    if yes and plan_only:
+        raise typer.BadParameter("--plan-only shows the plan and applies nothing; it can't be combined with --yes.")
+    if as_json and not (yes or plan_only):
+        raise typer.BadParameter("--json never prompts: add --plan-only to preview, or --yes to apply.")
+
+
+_PLAN_ONLY_HELP = (
+    "Build, upload and show the plan, then stop: nothing is applied on the server and nothing is asked."
+)
+_JSON_HELP = "Print the outcome and the plan as JSON on stdout (human output goes to stderr). Needs --plan-only or --yes."
+
+
 @app.command("deploy")
 def deploy(
     app_name: str = typer.Argument(..., help="Name of the local Frappe app directory to sync."),
@@ -478,8 +520,11 @@ def deploy(
     label: str | None = typer.Option(
         None, "--label", help="Tag the deployed drafts, e.g. a task ID (TASK-142); shown by 'benchops status'."
     ),
+    plan_only: bool = typer.Option(False, "--plan-only", help=_PLAN_ONLY_HELP),
+    as_json: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
     """Deploy your commits and staged changes (git add) to a remote server."""
+    _check_non_interactive(yes, plan_only, as_json)
     command = DeployCommand(
         server_alias=server_alias,
         app_name=app_name,
@@ -490,8 +535,9 @@ def deploy(
         break_lock=break_lock,
         skip_build=skip_build,
         label=label,
+        plan_only=plan_only,
     )
-    command.execute()
+    _run(command, as_json)
 
 
 @app.command("sync")
@@ -510,8 +556,11 @@ def sync(
     skip_build: bool = typer.Option(
         False, "--skip-build", help="Don't build locally, even if the commits touch frontend source."
     ),
+    plan_only: bool = typer.Option(False, "--plan-only", help=_PLAN_ONLY_HELP),
+    as_json: bool = typer.Option(False, "--json", help=_JSON_HELP),
 ) -> None:
     """Bring the server up to your latest commits (no staged files); deployed drafts those commits contain become committed."""
+    _check_non_interactive(yes, plan_only, as_json)
     command = DeployCommand(
         server_alias=server_alias,
         app_name=app_name,
@@ -522,8 +571,9 @@ def sync(
         break_lock=break_lock,
         skip_build=skip_build,
         sync=True,
+        plan_only=plan_only,
     )
-    command.execute()
+    _run(command, as_json)
 
 
 @app.command("status")
@@ -531,9 +581,12 @@ def status(
     app_name: str = typer.Argument(..., help="Name of the Frappe app."),
     server_alias: str = typer.Argument(..., help="Alias of the target server."),
     files: bool = typer.Option(False, "--files", help="List every changed file instead of counts."),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print the state as JSON on stdout, with every file (human output goes to stderr)."
+    ),
 ) -> None:
     """Show what a server runs for an app: who deployed what, and what changed there since."""
-    StatusCommand(server_alias=server_alias, app_name=app_name, files=files).execute()
+    _run(StatusCommand(server_alias=server_alias, app_name=app_name, files=files), as_json)
 
 
 @server_app.command("add-hook")
@@ -656,9 +709,17 @@ def logs(
         help="Specific log to tail (frappe.log, web.error.log, or worker.error.log). "
         "Defaults to tailing all three together.",
     ),
+    lines: int | None = typer.Option(
+        None,
+        "--lines",
+        "-n",
+        min=1,
+        max=10000,
+        help="Print the last N lines of each log and exit, instead of following them (for scripts and AI agents).",
+    ),
 ) -> None:
-    """Tail bench log files on a remote server in real time. Press Ctrl+C to stop."""
-    command = LogsCommand(server_alias=server_alias, log_type=log_type)
+    """Tail bench log files on a remote server in real time (Ctrl+C stops), or print the last lines with --lines."""
+    command = LogsCommand(server_alias=server_alias, log_type=log_type, lines=lines)
     command.execute()
 
 
@@ -1153,3 +1214,71 @@ def clone(
 
 if __name__ == "__main__":
     app()
+
+
+# --------------------------------------------------------------------------- Claude skill
+
+
+@skill_app.command("install")
+def skill_install(
+    force: bool = typer.Option(
+        False, "--force", help="Replace a copy that was edited, made by hand, or is a symbolic link."
+    ),
+) -> None:
+    """Install or update the Claude Code skill for this version of benchops."""
+    version = installed_version()
+    try:
+        path, replaced = claude_skill.install(version, force=force)
+    except (claude_skill.SkillError, OSError) as exc:
+        console.print(f"[red]Error: {escape(str(exc))}[/red]")
+        raise typer.Exit(1)
+    if replaced == version:
+        console.print(f"[green]The Claude skill for benchops {version} is already installed; refreshed {path}.[/green]")
+    elif replaced:
+        console.print(f"[green]Updated the Claude skill from {replaced} to benchops {version}: {path}[/green]")
+    else:
+        console.print(f"[green]Installed the Claude skill for benchops {version}: {path}[/green]")
+    console.print(
+        "\nClaude Code picks it up in new sessions.\n"
+        "So Claude knows where each app deploys, add a table like this\n"
+        "to CLAUDE.md in your bench root (or to ~/.claude/CLAUDE.md):\n"
+    )
+    console.print(escape(claude_skill.TARGETS_SNIPPET), highlight=False)
+    console.print("[dim]Run 'benchops skill install' again after upgrading benchops.[/dim]")
+
+
+@skill_app.command("uninstall")
+def skill_uninstall(
+    force: bool = typer.Option(False, "--force", help="Remove it even if it was edited or not installed by benchops."),
+) -> None:
+    """Remove the Claude Code skill."""
+    try:
+        path = claude_skill.uninstall(force=force)
+    except (claude_skill.SkillError, OSError) as exc:
+        console.print(f"[red]Error: {escape(str(exc))}[/red]")
+        raise typer.Exit(1)
+    if path is None:
+        console.print(f"[yellow]The Claude skill isn't installed ({claude_skill.skill_path()}).[/yellow]")
+    else:
+        console.print(f"[green]Removed the Claude skill: {path}[/green]")
+
+
+@skill_app.command("status")
+def skill_status() -> None:
+    """Show whether the Claude Code skill is installed, and for which version."""
+    version = installed_version()
+    found = claude_skill.inspect_installed()
+    if found is None:
+        console.print(f"Not installed (would go to {claude_skill.skill_path()}). Run 'benchops skill install'.")
+        return
+    console.print(f"Installed at {found.path}")
+    if found.symlink:
+        console.print("[yellow]It is a symbolic link, not managed by benchops.[/yellow]")
+    elif found.version is None:
+        console.print("[yellow]Not installed by benchops (a hand-made copy); 'skill install --force' replaces it.[/yellow]")
+    elif found.version != version:
+        console.print(f"[yellow]From benchops {found.version}; you have {version}. Run 'benchops skill install'.[/yellow]")
+    else:
+        console.print(f"[green]Up to date (benchops {version}).[/green]")
+    if found.modified:
+        console.print("[yellow]Edited since it was installed; 'skill install' will ask for --force.[/yellow]")

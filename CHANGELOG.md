@@ -5,6 +5,14 @@ version, whether a newer one is available, and what changed.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-01
+
+### Added
+- `deploy --plan-only` / `sync --plan-only`: builds, uploads and shows the plan, then stops without asking anything. Nothing is applied on the server and the lock is released. Unstaged frontend changes are built anyway, as with `--yes`, so the plan shows the build that would ship. Apply the plan afterwards with `--yes` (add `--skip-build` when nothing changed since, to skip a second build).
+- `--json` for `deploy`, `sync` and `status`: stdout carries exactly one JSON document and everything else (progress, the plan, hook and build output) goes to stderr. Deploy and sync report `outcome` (`planned`, `applied`, `up_to_date`, `aborted` or `failed`), the reason, the plan (files written, overlaps with their reasons, drafts taken over or committed, warnings, suggested bench steps) and, once applied, the backups made and whether the post-remote hooks succeeded. `status --json` lists every draft with its owner, label, age and whether it was edited on the server, plus hand edits and the server's git status. `--json` never prompts, so deploy and sync need `--plan-only` or `--yes` with it. Meant for scripts and AI agents.
+- `benchops skill install`: installs the Claude Code skill that ships with this version into `~/.claude/skills/benchops/` (`%USERPROFILE%\.claude` on Windows, or `$CLAUDE_CONFIG_DIR`), so Claude can deploy, sync and check staging through benchops safely: preview first, ask before applying, never overwrite or force on its own. Run it again after upgrading; every command points out a skill left from an older version. A copy that was edited, made by hand or symlinked is only replaced with `--force`. `benchops skill status` and `benchops skill uninstall` complete it.
+- `benchops logs --lines N` (`-n N`): prints the last N lines of the logs and exits instead of following them, for scripts and AI agents.
+
 ## [0.21.1] - 2026-11-01
 
 ### Fixed

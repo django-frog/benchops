@@ -13,6 +13,7 @@ import sys
 import pytest
 import typer
 
+from benchops import cli
 from benchops.deploy import DeployCommand
 from benchops.runner import LocalRunner
 from benchops.status import StatusCommand
@@ -97,11 +98,17 @@ def benches(tmp_path, monkeypatch, tools_log):
     return local, remote
 
 
-def deploy(remote, config=None, site=None, **options):
-    command = DeployCommand(server_alias="staging", app_name=APP, site=site, **{"yes": True, **options})
+def deploy_command(remote, config=None, site=None, **options):
+    command = DeployCommand(server_alias="staging", app_name=APP, site=site, **options)
     command._get_server_config = lambda: {"bench_path": str(remote), **(config or {})}
     command._get_remote_runner = lambda server_config: LocalRunner()
+    return command
+
+
+def deploy(remote, config=None, site=None, **options):
+    command = deploy_command(remote, config, site, **{"yes": True, **options})
     command.execute()
+    return command
 
 
 def status(path):
@@ -716,6 +723,7 @@ def run_status(remote, files=True):
     command._get_server_config = lambda: {"bench_path": str(remote)}
     command._get_remote_runner = lambda server_config: LocalRunner()
     command.execute()
+    return command
 
 
 def test_status_groups_drafts_by_label_and_developer(benches, tmp_path, monkeypatch, capsys):
@@ -1044,3 +1052,187 @@ def test_drafts_unstaged_on_the_server_are_staged_again(benches):
     deploy(remote)
 
     assert sorted(status(rapp)) == sorted([f"A  {APP}/api.py", f"M  {APP}/hooks.py"])
+
+
+# --------------------------------------------------------------------------- --plan-only and --json
+
+
+def no_prompts(monkeypatch):
+    def refuse(message, *args, **kwargs):
+        raise AssertionError(f"prompted: {message}")
+
+    monkeypatch.setattr(typer, "confirm", refuse)
+
+
+def test_plan_only_shows_the_plan_and_changes_nothing(benches, monkeypatch, capsys):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", "-A")
+    head_before, status_before = git(rapp, "rev-parse", "HEAD"), status(rapp)
+    no_prompts(monkeypatch)
+
+    command = deploy(remote, yes=False, plan_only=True, label="TASK-7")
+
+    out = flat(capsys.readouterr().out)
+    assert "Deploy plan" in out and f"{APP}/api.py" in out
+    assert "Plan only: nothing was applied on the server. Applying it needs --yes." in out
+    assert git(rapp, "rev-parse", "HEAD") == head_before
+    assert status(rapp) == status_before
+    assert not (rapp / APP / "api.py").exists()
+    assert not (rapp / ".git" / "benchops" / "deploy.json").exists()
+    assert not lock_file(remote).exists()
+    assert not list((rapp / ".git" / "benchops").glob("package-*"))
+
+    report = command.report
+    assert (report["ok"], report["outcome"], report["result"]) == (True, "planned", None)
+    plan = report["plan"]
+    assert plan["staged_files"] == [{"status": "A", "path": f"{APP}/api.py"}]
+    assert plan["writes"] == [{"status": "A", "path": f"{APP}/api.py"}]
+    assert plan["overlaps"] == []
+    assert plan["suggested_steps"] == ["bench restart"]
+    assert plan["local"]["branch"] == "develop" and plan["server"]["commit"] == head_before.strip()
+
+    # The plan can then be applied as shown, without rebuilding.
+    applied = deploy(remote, skip_build=True, label="TASK-7")
+    assert (rapp / APP / "api.py").read_text() == "x = 1\n"
+    assert applied.report["outcome"] == "applied"
+    assert applied.report["result"]["applied"] is True
+    assert applied.report["result"]["post_remote_hooks"] == "ok"
+
+
+def test_plan_only_reports_overlaps_with_their_reasons(benches, monkeypatch, capsys):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(rapp / APP / "hooks.py", "edited on staging\n")
+    write(app / APP / "hooks.py", "mine\n")
+    git(app, "add", "-A")
+    no_prompts(monkeypatch)
+
+    command = deploy(remote, yes=False, plan_only=True)
+
+    assert command.report["plan"]["overlaps"] == [{"path": f"{APP}/hooks.py", "reason": "modified on staging"}]
+    assert command.report["message"].endswith("needs --yes --overwrite (1 overlap(s)).")
+    assert (rapp / APP / "hooks.py").read_text() == "edited on staging\n"
+    assert not lock_file(remote).exists()
+
+
+def test_plan_only_builds_through_unstaged_frontend_changes_without_asking(benches, tools_log, monkeypatch, capsys):
+    local, remote = benches
+    app = local / "apps" / APP
+    write(app / APP / "public" / "js" / "form.js", "staged")
+    git(app, "add", "-A")
+    git(app, "commit", "-q", "-m", "js")
+    write(app / APP / "public" / "js" / "form.js", "unstaged")
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", f"{APP}/api.py")
+    no_prompts(monkeypatch)
+
+    command = deploy(remote, yes=False, plan_only=True)
+
+    assert "Building anyway (--plan-only)" in flat(capsys.readouterr().out)
+    assert command.report["frontend_unshipped"] == [f"{APP}/public/js/form.js"]
+    assert command.report["outcome"] == "planned"
+
+
+def test_plan_only_when_already_up_to_date(benches, monkeypatch):
+    local, remote = benches
+    write(local / "apps" / APP / APP / "api.py", "x = 1\n")
+    git(local / "apps" / APP, "add", "-A")
+    deploy(remote)
+    no_prompts(monkeypatch)
+
+    command = deploy(remote, yes=False, plan_only=True)
+
+    assert (command.report["ok"], command.report["outcome"], command.report["plan"]) == (True, "up_to_date", None)
+
+
+def test_report_records_why_a_deploy_stopped(benches, capsys):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(rapp / APP / "hooks.py", "edited on staging\n")
+    write(app / APP / "hooks.py", "mine\n")
+    git(app, "add", "-A")
+    command = deploy_command(remote, yes=True)
+
+    with pytest.raises(typer.Exit):
+        command.execute()
+
+    assert (command.report["ok"], command.report["outcome"]) == (False, "aborted")
+    assert "add --overwrite" in command.report["message"]
+    assert command.report["plan"]["overlaps"][0]["path"] == f"{APP}/hooks.py"
+    assert command.report["result"] is None
+
+
+def test_report_shows_staging_changed_when_a_post_remote_hook_fails(benches):
+    local, remote = benches
+    app = local / "apps" / APP
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", "-A")
+    command = deploy_command(remote, config={"post_remote_commands": ["false"]}, yes=True)
+
+    with pytest.raises(typer.Exit):
+        command.execute()
+
+    assert (command.report["ok"], command.report["outcome"]) == (False, "failed")
+    assert command.report["result"]["applied"] is True
+    assert command.report["result"]["post_remote_hooks"] == "failed"
+
+
+def test_json_puts_only_the_report_on_stdout(benches, capfd):
+    local, remote = benches
+    app = local / "apps" / APP
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", "-A")
+    command = deploy_command(remote, config={"post_remote_commands": ["echo hook-output"]}, yes=True)
+
+    cli._run(command, as_json=True)
+
+    out, err = capfd.readouterr()
+    report = json.loads(out)  # stdout is exactly one JSON document
+    assert (report["schema"], report["outcome"]) == (1, "applied")
+    assert "hook-output" in err and "Deploy plan" in err
+
+
+def test_json_reports_a_failure_and_keeps_the_exit_code(benches, capfd):
+    local, remote = benches
+    git(remote / "apps" / APP, "-c", "user.name=ops", "-c", "user.email=ops@x", "commit", "-q", "--allow-empty", "-m", "on staging")
+    write(local / "apps" / APP / APP / "api.py", "x = 1\n")
+    git(local / "apps" / APP, "add", "-A")
+    command = deploy_command(remote, plan_only=True)
+
+    with pytest.raises(typer.Exit) as exc:
+        cli._run(command, as_json=True)
+
+    assert exc.value.exit_code == 1
+    report = json.loads(capfd.readouterr().out)
+    assert (report["ok"], report["outcome"]) == (False, "aborted")
+    assert "not in your history" in report["message"]
+
+
+def test_status_report_has_every_draft_and_hand_edit(benches, capsys):
+    local, remote = benches
+    app, rapp = local / "apps" / APP, remote / "apps" / APP
+    write(app / APP / "hooks.py", "mine\n")
+    write(app / APP / "api.py", "x = 1\n")
+    git(app, "add", "-A")
+    deploy(remote, label="TASK-142")
+    git(app, "commit", "-q", "-m", "TASK-142")
+    write(rapp / APP / "api.py", "edited on staging\n")
+    write(rapp / APP / "scratch.py", "")
+
+    report = run_status(remote, files=False).report
+
+    assert report["ok"] is True and report["branch"] == "develop"
+    drafts = {d["path"]: d for d in report["drafts"]}
+    assert set(drafts) == {f"{APP}/api.py", f"{APP}/hooks.py"}
+    assert drafts[f"{APP}/hooks.py"]["label"] == "TASK-142"
+    assert drafts[f"{APP}/hooks.py"]["name"] == "Dev"
+    assert (drafts[f"{APP}/hooks.py"]["age_days"], drafts[f"{APP}/hooks.py"]["stale"]) == (0, False)
+    assert drafts[f"{APP}/api.py"]["edited"] is True
+    # Committed as deployed, even though api.py was edited on staging since.
+    assert report["committed_locally"] == [f"{APP}/api.py", f"{APP}/hooks.py"]
+    assert report["hand_edits"] == [f"{APP}/api.py", f"{APP}/scratch.py"]
+    assert report["last_deploy"]["label"] == "TASK-142"
+    assert report["lock"] is None
+    json.dumps(report)  # serialisable as is

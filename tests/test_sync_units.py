@@ -5,6 +5,7 @@ post-deploy step suggestions, and CLI flag wiring.
 
 import json
 import os
+import re
 import platform
 import subprocess
 
@@ -313,8 +314,56 @@ def test_cli_deploy_passes_flags(deploy_kwargs):
         "break_lock": True,
         "skip_build": True,
         "label": None,
+        "plan_only": False,
         "executed": True,
     }
+
+
+def usage_error(result):
+    """The text of a usage error, without the box Rich draws around it."""
+    return " ".join(re.sub(r"[│╭╮╰╯─]", " ", result.output).split())
+
+
+@pytest.mark.parametrize("command", ["deploy", "sync"])
+def test_cli_plan_only_is_passed_and_excludes_yes(deploy_kwargs, command):
+    result = CliRunner().invoke(cli.app, [command, "myapp", "staging", "--plan-only"])
+    assert result.exit_code == 0, result.output
+    assert deploy_kwargs["plan_only"] is True and deploy_kwargs["yes"] is False
+
+    result = CliRunner().invoke(cli.app, [command, "myapp", "staging", "--plan-only", "--yes"])
+    assert result.exit_code == 2
+    assert "can't be combined with --yes" in usage_error(result)
+
+
+@pytest.mark.parametrize("command", ["deploy", "sync"])
+def test_cli_json_never_prompts(deploy_kwargs, command):
+    result = CliRunner().invoke(cli.app, [command, "myapp", "staging", "--json"])
+
+    assert result.exit_code == 2
+    assert "--json never prompts" in usage_error(result)
+    assert "executed" not in deploy_kwargs
+
+
+def test_cli_json_prints_the_report_even_when_the_command_fails(monkeypatch):
+    import typer
+
+    class FailingDeploy:
+        def __init__(self, **kwargs):
+            self.report = {"command": "deploy", "ok": False, "outcome": "failed", "message": "boom"}
+
+        def execute(self):
+            print("human progress")
+            raise typer.Exit(1)
+
+    monkeypatch.setattr(cli, "DeployCommand", FailingDeploy)
+
+    result = CliRunner().invoke(cli.app, ["deploy", "myapp", "staging", "--yes", "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "schema": 1, "command": "deploy", "ok": False, "outcome": "failed", "message": "boom"
+    }
+    assert "human progress" in result.stderr
 
 
 def test_cli_deploy_defaults_are_safe(deploy_kwargs):
