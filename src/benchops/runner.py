@@ -33,17 +33,21 @@ class BenchOpsConnectionError(Exception):
     process, or a failed SSM tunnel/subprocess."""
 
 
-class BenchOpsCommandError(Exception):
-    """Raised by Runner.capture() when the command itself ran (the transport
-    was fine) but exited non-zero. Carries the captured output so callers
-    can decide how to surface it, rather than only getting a return code.
+class BenchOpsCommandError(subprocess.CalledProcessError):
+    """Raised by every runner's run() and capture() when the command itself
+    ran (the transport was fine) but exited non-zero. Carries the captured
+    output (capture() only) so callers can decide how to surface it.
+
+    It is a CalledProcessError, so existing handlers keep working, but its
+    message never includes the command, which may carry passwords.
     """
 
-    def __init__(self, exit_code: int, stdout: str, stderr: str) -> None:
+    def __init__(self, exit_code: int, stdout: str = "", stderr: str = "") -> None:
+        super().__init__(exit_code, "<command>", stdout, stderr)
         self.exit_code = exit_code
-        self.stdout = stdout
-        self.stderr = stderr
-        super().__init__(f"Command exited with code {exit_code}")
+
+    def __str__(self) -> str:
+        return f"Command exited with code {self.exit_code}"
 
 
 class Runner(ABC):
@@ -62,7 +66,9 @@ class Runner(ABC):
         tolerates a non-zero exit (the expected result of being
         interrupted) instead of raising for it.
 
-        Raises BenchOpsConnectionError if the transport itself fails.
+        Raises BenchOpsConnectionError if the transport itself fails, or
+        BenchOpsCommandError if the command exits non-zero (not raised for
+        interactive runs, where being interrupted is the normal ending).
         """
 
     @abstractmethod
@@ -137,7 +143,7 @@ class LocalRunner(Runner):
             print(line, end="")
         returncode = proc.wait()
         if returncode != 0:
-            raise subprocess.CalledProcessError(returncode, command)
+            raise BenchOpsCommandError(returncode)
 
     def capture(self, command: str, cwd: str | None = None) -> str:
         """Run a shell command locally and return its captured stdout."""
@@ -264,9 +270,11 @@ class RemoteRunner(Runner):
         full_command = f"cd {shlex.quote(cwd)} && {command}" if cwd else command
         try:
             self._ensure_open()
-            self.connection.run(full_command, hide=False, pty=interactive, warn=interactive)
+            result = self.connection.run(full_command, hide=False, pty=interactive, warn=True)
         except (paramiko.ssh_exception.SSHException, OSError) as exc:
             raise self._connection_error("connect", exc) from exc
+        if result.exited != 0 and not interactive:
+            raise BenchOpsCommandError(result.exited)
 
     def capture(self, command: str, cwd: str | None = None) -> str:
         """Run a command on the remote host and return its captured stdout,

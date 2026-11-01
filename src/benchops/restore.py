@@ -37,7 +37,6 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import typer
-from invoke.exceptions import UnexpectedExit
 from rich.console import Console
 from rich.progress import BarColumn, DownloadColumn, Progress, TextColumn, TransferSpeedColumn
 
@@ -177,12 +176,12 @@ class RemoteTarget:
 
     def step(self, label: str, command: str, cwd: str | None = None) -> None:
         """Run a streamed step without ever printing its command, which may
-        carry passwords (invoke's UnexpectedExit message includes it)."""
+        carry passwords."""
         console.print(f"[cyan]{label}...[/cyan]")
         try:
             self.runner.run(command, cwd=cwd or self.bench)
-        except UnexpectedExit as exc:
-            raise RestoreFailed(f"{label} failed (exit code {exc.result.exited}).") from None
+        except BenchOpsCommandError as exc:
+            raise RestoreFailed(f"{label} failed (exit code {exc.exit_code}).") from None
 
     def download(self, s3: S3Backups, files: list[BackupFile], workdir: str) -> dict[str, str]:
         remote = {f.key: posixpath.join(workdir, f.name) for f in files}

@@ -6,7 +6,9 @@ from rich.markup import escape
 
 from benchops.auth import AuthManager, KeyringUnavailableError
 from benchops.config import ConfigManager
+from benchops.config import VALID_CONNECTION_TYPES
 from benchops.runner import BenchOpsConnectionError, RemoteRunner, Runner
+from benchops.ssm_shell import SsmShellRunner
 
 console = Console()
 
@@ -53,15 +55,33 @@ class BaseCommand:
         """Instantiate an authenticated runner for the server's connection_type.
 
         Returns the abstract Runner interface rather than a concrete class so
-        that call sites never need to know whether traffic is going over a
-        direct SSH connection or a tunneled SSM session.
+        that call sites never need to know whether traffic is going over SSH,
+        an SSM shell session, or SSH tunneled through SSM.
         """
         connection_type = server_config.get("connection_type", "ssh")
-        if connection_type not in ("ssh", "ssm"):
+        if connection_type not in VALID_CONNECTION_TYPES:
             console.print(
                 f"[red]Error: Unknown connection_type '{connection_type}' for '{self.server_alias}'.[/red]"
             )
             raise typer.Exit(1)
+
+        if connection_type in ("ssm", "ssm-ssh") and not server_config.get("instance_id"):
+            console.print(
+                f"[red]Error: Server '{self.server_alias}' has connection_type '{connection_type}' "
+                "but no instance_id configured.[/red]"
+            )
+            raise typer.Exit(1)
+
+        if connection_type == "ssm":
+            # Authenticated by IAM alone; no SSH credentials involved.
+            try:
+                return SsmShellRunner.connect(server_config)
+            except BenchOpsConnectionError as exc:
+                console.print(
+                    f"[red]Error: Could not open an SSM session to '{self.server_alias}':[/red] {escape(str(exc))}\n"
+                    f"[dim]Run 'benchops server check {self.server_alias}' to diagnose.[/dim]"
+                )
+                raise typer.Exit(1)
 
         try:
             password = self.auth.get_password(self.server_alias)
@@ -81,15 +101,7 @@ class BaseCommand:
             )
             raise typer.Exit(1)
 
-        if connection_type == "ssm":
-            instance_id = server_config.get("instance_id")
-            if not instance_id:
-                console.print(
-                    f"[red]Error: Server '{self.server_alias}' has connection_type 'ssm' "
-                    "but no instance_id configured.[/red]"
-                )
-                raise typer.Exit(1)
-
+        if connection_type == "ssm-ssh":
             try:
                 return RemoteRunner.via_ssm(server_config, password=password, key_path=key_path)
             except BenchOpsConnectionError as exc:

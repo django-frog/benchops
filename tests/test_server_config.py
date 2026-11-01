@@ -16,6 +16,17 @@ def config(tmp_path, monkeypatch):
     return manager
 
 
+class FakeAwsSession:
+    region_name = "ap-south-1"
+
+    def client(self, service):
+        assert service == "sts"
+        return self
+
+    def get_caller_identity(self):
+        return {"Arn": "arn:aws:iam::123456789012:user/dev"}
+
+
 def invoke(*args, input=None):
     return CliRunner().invoke(cli.app, list(args), input=input, env={"COLUMNS": "250"})
 
@@ -41,8 +52,10 @@ def test_explicit_values_still_replace_existing_ones(config):
     assert server["private_key_path"] == "/new" and server["post_remote_commands"] == []
 
 
-def test_ssm_server_add_lists_instances_to_pick_from(config, monkeypatch):
-    monkeypatch.setattr("benchops.cli.session_for", lambda server: object())
+def test_ssm_server_add_asks_for_the_profile_then_lists_instances(config, monkeypatch):
+    used = []
+    monkeypatch.setattr("benchops.cli.available_profiles", lambda: ["Akwad", "dev-test"])
+    monkeypatch.setattr("benchops.cli.session_for", lambda server: used.append(server) or FakeAwsSession())
     monkeypatch.setattr(
         "benchops.cli.list_managed_instances",
         lambda session: [
@@ -52,13 +65,16 @@ def test_ssm_server_add_lists_instances_to_pick_from(config, monkeypatch):
     )
     result = invoke(
         "server", "add", "--alias", "dev", "--connection-type", "ssm", "--user", "frappe",
-        "--bench-path", "/home/frappe/bench", "--aws-region", "ap-south-1", input="1\n",
+        "--bench-path", "/home/frappe/bench", "--aws-region", "ap-south-1", input="1\n1\n",
     )
     assert result.exit_code == 0, result.output
-    assert "develop.example.com" in result.output and "auth setup-keys dev" in result.output
+    assert used == [{"aws_profile": "Akwad", "aws_region": "ap-south-1"}]
+    assert "arn:aws:iam::123456789012:user/dev" in result.output  # whose instances these are
+    assert "develop.example.com" in result.output
+    assert "server check dev" in result.output and "setup-keys" not in result.output  # ssm needs no key
     server = config.get_server("dev")
     assert server["instance_id"] == "i-111" and server["host"] == "i-111" and server["port"] == 22
-    assert server["aws_region"] == "ap-south-1"
+    assert server["aws_region"] == "ap-south-1" and server["aws_profile"] == "Akwad"
     assert "Server host" not in result.output  # no meaningless host prompt for ssm
 
 
@@ -69,7 +85,7 @@ def test_ssm_server_add_falls_back_to_typing_the_id(config, monkeypatch):
     monkeypatch.setattr("benchops.cli.session_for", denied)
     result = invoke(
         "server", "add", "--alias", "dev", "--connection-type", "ssm", "--user", "frappe",
-        "--bench-path", "/b", input="i-0abc\n",
+        "--bench-path", "/b", "--aws-profile", "dev-test", input="i-0abc\n",
     )
     assert result.exit_code == 0, result.output
     assert "Could not list" in result.output
@@ -84,3 +100,32 @@ def test_ssh_server_add_still_asks_for_host_and_port(config):
     assert result.exit_code == 0, result.output
     server = config.get_server("web")
     assert server["host"] == "10.0.0.5" and server["port"] == 2222 and "instance_id" not in server
+
+
+def test_under_aws_vault_the_profile_is_not_asked(config, monkeypatch):
+    monkeypatch.setenv("AWS_VAULT", "Akwad")
+    monkeypatch.setattr("benchops.cli.available_profiles", lambda: pytest.fail("profiles listed"))
+    monkeypatch.setattr("benchops.cli.session_for", lambda server: FakeAwsSession())
+    monkeypatch.setattr(
+        "benchops.cli.list_managed_instances", lambda session: [ManagedInstance("i-1", "a", "Online", "RHEL")]
+    )
+    result = invoke(
+        "server", "add", "--alias", "dev", "--connection-type", "ssm", "--user", "u", "--bench-path", "/b", input="1\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert config.get_server("dev")["aws_profile"] == "Akwad"
+
+
+def test_ssm_ssh_server_add_points_to_setup_keys(config):
+    result = invoke(
+        "server", "add", "--alias", "dev", "--connection-type", "ssm-ssh", "--user", "u", "--bench-path", "/b",
+        "--instance-id", "i-1",
+    )
+    assert result.exit_code == 0, result.output
+    assert "auth setup-keys dev" in result.output
+    assert config.get_server("dev")["connection_type"] == "ssm-ssh"
+
+
+def test_connection_type_prompt_shows_plain_values(config):
+    result = invoke("server", "add", "--alias", "web", input="\nu\n/b\nhost\n22\n")
+    assert "[ssh]" in result.output and "ConnectionType" not in result.output

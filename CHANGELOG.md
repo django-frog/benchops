@@ -5,6 +5,20 @@ version, whether a newer one is available, and what changed.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-01
+
+### Added
+- `connection_type = "ssm"` now runs everything — commands, captured output, file uploads, `logs -f` with Ctrl+C — inside an AWS Session Manager shell session. No sshd, SSH keys or port forwarding: it needs only the IAM permission behind `aws ssm start-session --target <instance>`, and commands run as the user your Session Manager preferences set (or via `sudo -n -u <user>` from the session user, which `server check` verifies).
+- `server add` for SSM servers asks which AWS profile to use (or takes the aws-vault one), shows the AWS identity it resolved to, then lists the instances to pick from.
+
+### Changed
+- SSH tunneled through Session Manager (the 0.20.0 behaviour of `ssm`) is now `connection_type = "ssm-ssh"`; `auth setup-keys` applies to it only. Servers added as `ssm` with 0.20.0 switch to the shell session and no longer use their key.
+- A failed remote command raises the same error (`BenchOpsCommandError`) on every transport.
+- Access-denied hints name the SSM document actually used, and `ssm:DescribeInstanceInformation` is shown as needing resource `*`.
+
+### Fixed
+- The connection-type prompt showed its default as `ConnectionType.ssh` (Python 3.14).
+
 ## [0.20.0] - 2026-11-01
 
 ### Added

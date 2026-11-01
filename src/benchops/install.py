@@ -1,11 +1,10 @@
 """Installation command logic."""
 
 import typer
-from invoke.exceptions import UnexpectedExit
 from rich.console import Console
 
 from benchops.base import BaseCommand
-from benchops.runner import BenchOpsConnectionError
+from benchops.runner import BenchOpsCommandError, BenchOpsConnectionError
 
 console = Console()
 
@@ -39,6 +38,6 @@ class InstallCommand(BaseCommand):
 
                 console.print(f"[green]Successfully executed install hooks for '{self.app_name}' on '{self.server_alias}'.[/green]")
 
-            except (BenchOpsConnectionError, UnexpectedExit) as exc:
+            except (BenchOpsConnectionError, BenchOpsCommandError) as exc:
                 console.print(f"[red]Installation failed: {exc}[/red]")
                 raise typer.Exit(1)

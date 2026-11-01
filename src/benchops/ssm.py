@@ -59,8 +59,9 @@ def session_for(server_config: dict) -> boto3.Session:
         raise SsmError(str(exc)) from exc
 
 
-def explain_client_error(exc: Exception, instance_id: str, action: str) -> str:
-    """Turn an AWS error into a message that names the actual fix."""
+def explain_client_error(exc: Exception, instance_id: str, action: str, document: str | None = None) -> str:
+    """Turn an AWS error into a message that names the actual fix.
+    `document` is the SSM document a StartSession call used, if any."""
     if isinstance(exc, botocore.exceptions.NoCredentialsError):
         return (
             "No AWS credentials found. Set aws_profile on the server, run under "
@@ -75,9 +76,14 @@ def explain_client_error(exc: Exception, instance_id: str, action: str) -> str:
     code = error.get("Code", "")
     message = error.get("Message", str(exc))
     if code in ("AccessDeniedException", "AccessDenied"):
-        resources = f"arn:aws:ec2:*:*:instance/{instance_id}"
+        if action == "ssm:DescribeInstanceInformation":
+            resources = '"*" (it cannot be limited to instances)'
+        else:
+            resources = f"arn:aws:ec2:*:*:instance/{instance_id}"
         if action == "ssm:StartSession":
-            resources += f" and arn:aws:ssm:*::document/{PORT_FORWARD_DOCUMENT} (plus ssm:TerminateSession)"
+            if document:
+                resources += f" and arn:aws:ssm:*::document/{document}"
+            resources += " (plus ssm:TerminateSession)"
         return f"Your AWS identity is not allowed to call {action}. {message}\nAsk an AWS admin to allow {action} on {resources}."
     if code == "TargetNotConnected":
         return (
@@ -125,6 +131,56 @@ def list_managed_instances(session: boto3.Session, instance_ids: list[str] | Non
     return sorted(instances, key=lambda i: (i.ping_status != "Online", i.name, i.instance_id))
 
 
+# Popen options that keep the plugin out of the terminal's process group:
+# Ctrl+C is meant for the remote command (logs -f), not for the session
+# carrying it, which benchops ends itself.
+PLUGIN_ISOLATION = (
+    {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    if platform.system() == "Windows"
+    else {"start_new_session": True}
+)
+
+
+def start_session(session: boto3.Session, request: dict) -> tuple[object, dict, list[str]]:
+    """Call StartSession and build the session-manager-plugin argv that
+    carries it — what `aws ssm start-session` does, minus the AWS CLI.
+    Returns (ssm client, response, argv)."""
+    plugin = require_plugin()
+    try:
+        client = session.client("ssm")
+        response = client.start_session(**request)
+    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+        raise SsmError(
+            explain_client_error(exc, request["Target"], "ssm:StartSession", request.get("DocumentName"))
+        ) from exc
+    argv = [
+        plugin,
+        json.dumps(response, default=str),
+        client.meta.region_name,
+        "StartSession",
+        "",  # profile: not needed, the session token in the response is already authorized
+        json.dumps(request),
+        client.meta.endpoint_url,
+    ]
+    return client, response, argv
+
+
+def end_session(client, session_id: str | None, process: subprocess.Popen | None) -> None:
+    """Stop the plugin and terminate the SSM session; both best effort."""
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=TUNNEL_TERMINATE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=TUNNEL_TERMINATE_TIMEOUT_SECONDS)
+    if session_id and client is not None:
+        try:
+            client.terminate_session(SessionId=session_id)
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError):
+            pass  # it ends by itself at the idle timeout
+
+
 def find_free_local_port() -> int:
     """Ask the OS for an ephemeral, currently-unused loopback port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -148,7 +204,6 @@ class SsmTunnel:
         self._log_path: str | None = None
 
     def open(self) -> "SsmTunnel":
-        plugin = require_plugin()
         self.local_port = find_free_local_port()
         request = {
             "Target": self.instance_id,
@@ -158,39 +213,19 @@ class SsmTunnel:
                 "localPortNumber": [str(self.local_port)],
             },
         }
-        try:
-            self._client = self.session.client("ssm")
-            response = self._client.start_session(**request)
-        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
-            raise SsmError(explain_client_error(exc, self.instance_id, "ssm:StartSession")) from exc
+        self._client, response, argv = start_session(self.session, request)
         self.session_id = response["SessionId"]
 
         # The plugin's chatter goes to a file rather than a pipe nobody reads,
         # so a long session can never block on a full pipe buffer; it writes
         # in append mode and is read through a separate handle, so the two
-        # never share a file offset. It gets its own process group: Ctrl+C in
-        # the terminal is meant for the remote command (logs -f), not for the
-        # tunnel underneath it.
+        # never share a file offset.
         fd, self._log_path = tempfile.mkstemp(prefix="benchops-ssm-", suffix=".log")
         os.close(fd)
-        isolation = (
-            {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-            if platform.system() == "Windows"
-            else {"start_new_session": True}
-        )
-        argv = [
-            plugin,
-            json.dumps(response, default=str),
-            self._client.meta.region_name,
-            "StartSession",
-            "",  # profile: not needed, the session token above is already authorized
-            json.dumps(request),
-            self._client.meta.endpoint_url,
-        ]
         try:
             with open(self._log_path, "ab") as log:
                 self._process = subprocess.Popen(
-                    argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, **isolation
+                    argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, **PLUGIN_ISOLATION
                 )
         except OSError as exc:
             self.close()
@@ -236,19 +271,8 @@ class SsmTunnel:
 
     def close(self) -> None:
         """Stop the plugin and terminate the SSM session. Safe to call twice."""
-        if self._process is not None and self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=TUNNEL_TERMINATE_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=TUNNEL_TERMINATE_TIMEOUT_SECONDS)
-        if self.session_id and self._client is not None:
-            try:
-                self._client.terminate_session(SessionId=self.session_id)
-            except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError):
-                pass  # it ends by itself at the idle timeout
-            self.session_id = None
+        end_session(self._client, self.session_id, self._process)
+        self.session_id = None
         if self._log_path is not None:
             try:
                 os.remove(self._log_path)

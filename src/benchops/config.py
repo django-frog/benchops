@@ -10,7 +10,9 @@ from benchops.security import secure_file
 CONFIG_PATH = Path.home() / ".benchops" / "config.toml"
 
 DEFAULT_CONNECTION_TYPE = "ssh"
-VALID_CONNECTION_TYPES = {"ssh", "ssm"}
+# ssh: direct SSH. ssm: an AWS Session Manager shell session — no sshd, keys
+# or open port. ssm-ssh: SSH carried over a Session Manager port forward.
+VALID_CONNECTION_TYPES = {"ssh", "ssm", "ssm-ssh"}
 
 
 class ConfigManager:

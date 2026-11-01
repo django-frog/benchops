@@ -34,7 +34,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import typer
-from invoke.exceptions import UnexpectedExit
 from rich.console import Console
 
 from benchops.assets import collect_app_manifests, resolve_bench_path
@@ -493,7 +492,7 @@ class DeployCommand(BaseCommand):
             except RemoteAgentError as exc:
                 console.print(f"[red]{self.verb.capitalize()} failed: {self._describe_agent_error(exc)}[/red]")
                 raise typer.Exit(1)
-            except (subprocess.CalledProcessError, BenchOpsConnectionError, GitError, UnexpectedExit) as exc:
+            except (subprocess.CalledProcessError, BenchOpsConnectionError, GitError) as exc:
                 console.print(f"[red]{self.verb.capitalize()} failed: {exc}[/red]")
                 raise typer.Exit(1)
             finally:
@@ -517,7 +516,7 @@ class DeployCommand(BaseCommand):
         console.print("[yellow]Clearing caches on the server (new build outputs)...[/yellow]")
         try:
             runner.run("bench --site all clear-cache", cwd=bench_path)
-        except (subprocess.CalledProcessError, UnexpectedExit, BenchOpsConnectionError) as exc:
+        except (subprocess.CalledProcessError, BenchOpsConnectionError) as exc:
             console.print(
                 f"[yellow]Warning: 'bench --site all clear-cache' failed ({exc}); "
                 "run it on the server, or the old asset paths may still be served.[/yellow]"

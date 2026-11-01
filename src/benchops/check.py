@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import time
 
+import boto3
 import botocore.exceptions
 import typer
 from rich.console import Console
@@ -14,6 +15,7 @@ from rich.markup import escape
 from benchops.auth import KeyringUnavailableError
 from benchops.base import BaseCommand
 from benchops.runner import BenchOpsCommandError, BenchOpsConnectionError, RemoteRunner
+from benchops.ssm_shell import SsmShellRunner
 from benchops.ssm import PLUGIN, SsmError, SsmTunnel, explain_client_error, list_managed_instances, require_plugin, session_for
 
 console = Console()
@@ -57,26 +59,32 @@ class CheckCommand(BaseCommand):
         connection_type = server_config.get("connection_type", "ssh")
         console.print(f"[bold]Checking '{self.server_alias}'[/bold] [dim]({connection_type})[/dim]")
 
-        tunnel = None
-        if connection_type == "ssm":
-            tunnel = self._check_ssm(server_config)
-            if tunnel is None:
+        if connection_type == "ssh":
+            self._check_ssh(server_config, None)
+        else:
+            session = self._check_aws(server_config)
+            if session is None:
                 raise typer.Exit(1)
-
-        try:
-            self._check_ssh(server_config, tunnel)
-        finally:
-            if tunnel is not None:
-                tunnel.close()
+            if connection_type == "ssm":
+                self._check_shell(server_config, session)
+            else:
+                tunnel = self._check_tunnel(server_config, session)
+                if tunnel is None:
+                    raise typer.Exit(1)
+                try:
+                    self._check_ssh(server_config, tunnel)
+                finally:
+                    tunnel.close()
 
         if self.failed:
             raise typer.Exit(1)
         console.print(f"[green]'{self.server_alias}' is ready.[/green]")
 
-    def _check_ssm(self, server_config: dict) -> SsmTunnel | None:
+    def _check_aws(self, server_config: dict) -> boto3.Session | None:
+        """Plugin, credentials and registration: what every SSM transport needs."""
         instance_id = server_config.get("instance_id")
         if not instance_id:
-            console.print("[red]✗ No instance_id configured. Re-run 'benchops server add' with --instance-id.[/red]")
+            console.print("[red]✗ No instance_id configured. Re-run 'benchops server add' to pick the instance.[/red]")
             return None
 
         def plugin():
@@ -130,6 +138,47 @@ class CheckCommand(BaseCommand):
 
         if not self._step("Instance registered with SSM", registered):
             return None
+        return session
+
+    def _check_shell(self, server_config: dict, session: boto3.Session) -> None:
+        instance_id = server_config["instance_id"]
+        user = server_config["user"]
+
+        def shell():
+            try:
+                runner = SsmShellRunner(session, instance_id, user).open()
+            except SsmError as exc:
+                raise CheckFailed(str(exc)) from exc
+            except BenchOpsConnectionError as exc:
+                raise CheckFailed(str(exc)) from exc
+            detail = f"{runner.session_user}@{runner.hostname}"
+            if runner.session_user != user:
+                detail += f", commands run as '{user}' via sudo"
+            return (detail, runner)
+
+        runner = self._step("Shell session (ssm:StartSession)", shell)
+        if not runner:
+            return
+        try:
+            self._step("Bench directory", lambda: self._bench(runner, server_config))
+        finally:
+            runner.close()
+
+    def _bench(self, runner, server_config: dict):
+        bench_path = server_config["bench_path"]
+        quoted = shlex.quote(bench_path)
+        try:
+            runner.capture(f"test -d {quoted}/apps && test -d {quoted}/sites && test -x {quoted}/env/bin/python")
+        except BenchOpsCommandError as exc:
+            raise CheckFailed(
+                f"'{bench_path}' is not a bench (needs apps/, sites/ and env/) or '{server_config['user']}' cannot read it."
+            ) from exc
+        except BenchOpsConnectionError as exc:
+            raise CheckFailed(str(exc)) from exc
+        return (bench_path, None)
+
+    def _check_tunnel(self, server_config: dict, session: boto3.Session) -> SsmTunnel | None:
+        instance_id = server_config["instance_id"]
 
         def tunnel():
             try:
@@ -151,7 +200,7 @@ class CheckCommand(BaseCommand):
         if not password and not key_path:
             console.print(
                 "[red]✗[/red] SSH login\n    [red]No credentials configured. Run "
-                f"'benchops auth setup-keys {self.server_alias}' (ssm) or 'benchops server set-auth "
+                f"'benchops auth setup-keys {self.server_alias}' (ssm-ssh) or 'benchops server set-auth "
                 f"{self.server_alias}'.[/red]"
             )
             self.failed = True
@@ -163,7 +212,6 @@ class CheckCommand(BaseCommand):
             runner = RemoteRunner(server_config["host"], int(server_config["port"]), server_config["user"], password, key_path)
 
         user = server_config["user"]
-        bench_path = server_config["bench_path"]
 
         def login():
             try:
@@ -177,20 +225,8 @@ class CheckCommand(BaseCommand):
                 raise CheckFailed(f"{exc}\n    {hint}") from exc
             return (f"{user}@{hostname} with {'key ' + key_path if key_path else 'password'}", None)
 
-        def bench():
-            quoted = shlex.quote(bench_path)
-            try:
-                runner.capture(f"test -d {quoted}/apps && test -d {quoted}/sites && test -x {quoted}/env/bin/python")
-            except BenchOpsCommandError as exc:
-                raise CheckFailed(
-                    f"'{bench_path}' is not a bench (needs apps/, sites/ and env/) or '{user}' cannot read it."
-                ) from exc
-            except BenchOpsConnectionError as exc:
-                raise CheckFailed(str(exc)) from exc
-            return (bench_path, None)
-
         try:
             if self._step("SSH login", login):
-                self._step("Bench directory", bench)
+                self._step("Bench directory", lambda: self._bench(runner, server_config))
         finally:
             runner.connection.close()

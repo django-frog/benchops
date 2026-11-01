@@ -11,8 +11,8 @@ A robust Command Line Interface (CLI) tool designed to streamline and synchroniz
 * **Embedded Multiline Editor:** Write and manage your deployment scripts directly in the terminal using a built-in interactive editor (powered by `prompt_toolkit`).
 * **Dynamic Target Resolution:** Use the `{site}` and `{app}` placeholders in your hook configurations to dynamically target specific Frappe tenant environments and applications during execution.
 * **Secure Credential Management:** Store authentication methods locally, supporting both SSH private keys and passwords securely.
-* **Zero-Trust Access via AWS SSM:** Connect to EC2 instances with port 22 closed entirely, by tunneling SSH through an AWS Systems Manager Session Manager port-forwarding session (`connection_type = "ssm"`).
-* **SSM-Bootstrapped Trust:** `benchops auth setup-keys` generates a BenchOps-managed ed25519 keypair and installs the public half onto the instance via an SSM RunCommand — no pre-existing SSH access required.
+* **No SSH Needed with AWS SSM:** `connection_type = "ssm"` runs everything — commands, file transfers, log tailing — inside an AWS Session Manager shell session. No sshd, no SSH keys, no open port; only the IAM permission behind `aws ssm start-session`, and commands run as the user your Session Manager preferences say.
+* **SSH over SSM, if you prefer:** `connection_type = "ssm-ssh"` tunnels SSH through a Session Manager port forward, and `benchops auth setup-keys` installs a BenchOps key via SSM RunCommand.
 * **aws-vault Friendly:** Point a server at an aws-vault profile, or run under `aws-vault exec`; `benchops server check` diagnoses the whole SSM path step by step.
 * **Cross-Platform by Design:** Works natively on Linux, macOS, and Windows (PowerShell/cmd.exe) — no WSL required. Local hooks, file permissions, and the SSM tunnel all dispatch to OS-appropriate implementations under the hood.
 * **Bulk Cloning with Access Checks:** `benchops clone <project>` clones every repository of a project in parallel — public or on a private GitHub, GitLab, Gitea or plain git host. Your token is checked first and each repository shows your role (read / write / admin); repositories you can't read are skipped with the reason, and existing folders are never overwritten.
@@ -56,7 +56,7 @@ benchops server add \
 
 ```
 
-**AWS SSM** (`connection_type=ssm` — no open port 22 needed; traffic tunnels through Session Manager):
+**AWS SSM** (`connection_type=ssm` — no SSH at all; everything runs in a Session Manager shell session):
 
 ```bash
 benchops server add \
@@ -69,7 +69,17 @@ benchops server add \
 
 ```
 
-Leave out `--instance-id` and BenchOps lists the instances registered with SSM (name, platform, agent status) to pick from. `--aws-profile`/`--aws-region` are optional — omit them to use your default AWS credentials/region. `--port` is sshd's port on the instance (default 22); `--host` is only a label for SSM servers.
+Leave out `--aws-profile` and `--instance-id` and BenchOps asks which AWS profile to use, shows the AWS identity it resolved to, and lists the instances registered with SSM (name, platform, agent status) to pick from. `--host` is only a label for SSM servers.
+
+How `ssm` works: BenchOps opens one Session Manager shell session per command run (the same kind `aws ssm start-session --target <instance>` opens) and drives it — commands, captured output and uploaded files travel through it. It needs:
+
+* `ssm:StartSession` on the instance (with the account's default shell document — no port-forwarding document) and `ssm:TerminateSession`; `ssm:DescribeInstanceInformation` for the instance list.
+* The Session Manager plugin on your machine (no AWS CLI).
+* On the instance: the SSM agent online, and either Session Manager preferences → *Run As* set to `--user`, or the session user (`ssm-user`) allowed to `sudo -n -u <user>`. BenchOps checks this and says which one to fix.
+
+Session Manager carries input at roughly 0.2 MB/s, so large deploy packages upload more slowly than over SSH (payloads are gzipped first). Opening a session takes a few seconds.
+
+Prefer SSH carried over SSM? Use `--connection-type ssm-ssh`: SSH over a Session Manager port forward (needs the `AWS-StartPortForwardingSession` document allowed and a key — see [Bootstrapping SSH Trust via AWS SSM](#bootstrapping-ssh-trust-via-aws-ssm)).
 
 **aws-vault** works either way: set `--aws-profile` to the aws-vault profile and BenchOps fetches credentials with `aws-vault export` when the profile has none of its own (MFA/passphrase prompts appear in the terminal), or run any command under `aws-vault exec <profile> -- benchops ...`.
 
@@ -100,11 +110,11 @@ benchops server set-auth staging
 
 ```
 
-For `connection_type=ssm`, see [Bootstrapping SSH Trust via AWS SSM](#bootstrapping-ssh-trust-via-aws-ssm) below — it establishes an SSH key automatically, without needing SSH access to already exist.
+`connection_type=ssm` needs no SSH credentials at all. For `connection_type=ssm-ssh`, see [Bootstrapping SSH Trust via AWS SSM](#bootstrapping-ssh-trust-via-aws-ssm) below — it establishes an SSH key automatically, without needing SSH access to already exist.
 
 ## Bootstrapping SSH Trust via AWS SSM
 
-For `connection_type=ssm` servers, there's a chicken-and-egg problem: SSH-based deployment needs a key on the box, but you have no SSH access to put one there (that's the point of closing port 22). `benchops auth setup-keys` solves this by authenticating entirely through the SSM control plane (IAM), never over SSH:
+For `connection_type=ssm-ssh` servers, there's a chicken-and-egg problem: SSH-based deployment needs a key on the box, but you have no SSH access to put one there (that's the point of closing port 22). `benchops auth setup-keys` solves this by authenticating entirely through the SSM control plane (IAM), never over SSH:
 
 ```bash
 benchops auth setup-keys staging
@@ -249,7 +259,7 @@ benchops uninstall custom_app staging --site test-16.akwad.qa
 
 ## Operating a Deployed Site
 
-Once a server is registered and authenticated (`server add` + `server set-auth`/`auth setup-keys`), two commands cover the day-to-day operational work that doesn't need a full deploy — checking what's happening in the logs, and running one-off Frappe methods. Both work identically whether the server is `connection_type=ssh` or `connection_type=ssm`; the tunnel, if any, is set up and torn down automatically around each command.
+Once a server is registered and authenticated (`server add` + `server set-auth`/`auth setup-keys`), two commands cover the day-to-day operational work that doesn't need a full deploy — checking what's happening in the logs, and running one-off Frappe methods. Both work identically for `ssh`, `ssm` and `ssm-ssh` servers; any SSM session is opened and ended automatically around each command.
 
 ### Tailing Logs (`benchops logs`)
 
@@ -264,7 +274,7 @@ benchops logs staging --type web.error.log
 
 ```
 
-`--type` accepts `frappe.log`, `web.error.log`, or `worker.error.log`. Press **Ctrl+C** to stop — this closes the remote log stream (and, for `connection_type=ssm`, tears down the SSM tunnel) rather than leaving anything running on the server.
+`--type` accepts `frappe.log`, `web.error.log`, or `worker.error.log`. Press **Ctrl+C** to stop — this closes the remote log stream (and ends the SSM session, for SSM servers) rather than leaving anything running on the server.
 
 Log files are read from `<bench_path>/logs/<name>` on the server — the standard location for a Frappe bench — so no extra configuration is needed beyond the server's existing `bench_path`.
 
@@ -451,7 +461,7 @@ The apps installed in the backup must also be installed on the bench, ideally at
 
 ### Trust Bootstrapping (`benchops auth`)
 
-* `setup-keys <alias>`: Generate/reuse the BenchOps SSH keypair and install it on a `connection_type=ssm` server via an SSM RunCommand — see [Bootstrapping SSH Trust via AWS SSM](#bootstrapping-ssh-trust-via-aws-ssm).
+* `setup-keys <alias>`: Generate/reuse the BenchOps SSH keypair and install it on a `connection_type=ssm-ssh` server via an SSM RunCommand — see [Bootstrapping SSH Trust via AWS SSM](#bootstrapping-ssh-trust-via-aws-ssm).
 
 ### Git Hosts (`benchops git`)
 
@@ -493,6 +503,7 @@ You should see all tests pass, including:
 
 * `tests/test_local_runner_windows.py` — confirms `LocalRunner` uses `shell=True` with an unmodified command string on Windows (preserving `C:\path\like\this`), and the original `shlex.split` + `shell=False` behavior on Linux/macOS.
 * `tests/test_secure_file_permissions.py` — confirms `secure_file()` calls `chmod` on POSIX and `icacls` on Windows, including its failure paths (missing `icacls`, missing `USERNAME`, non-zero exit).
+* `tests/test_ssm_shell.py` — the `ssm` runner end to end against a real interactive bash in a pseudo-terminal: framing through echo and prompts, stdout/stderr/exit codes, binary uploads, long commands, Ctrl+C, and sessions that must `sudo` to the configured user.
 * `tests/test_ssm.py` — credentials (aws-vault included), the error explanations, and the tunnel's lifecycle, driven by a fake `session-manager-plugin` run as a real subprocess: readiness, early exit, timeout, and that closing always terminates both the plugin and the SSM session.
 
 To exercise a single file: `uv run pytest tests/test_ssm.py -v`.
@@ -516,7 +527,7 @@ Confirm `~/.benchops/config.toml` was created with `600` permissions (`ls -l ~/.
 This is the part that actually needs AWS. Prerequisites:
 
 * An EC2 instance with the SSM Agent registered (**Systems Manager → Fleet Manager** shows it "Online") and an IAM role with `AmazonSSMManagedInstanceCore`.
-* AWS credentials (a profile, aws-vault, or the default chain) with the permissions listed under [Bootstrapping SSH Trust via AWS SSM](#bootstrapping-ssh-trust-via-aws-ssm).
+* AWS credentials (a profile, aws-vault, or the default chain) with `ssm:StartSession` and `ssm:TerminateSession` on the instance (for `ssm-ssh`, the permissions listed under [Bootstrapping SSH Trust via AWS SSM](#bootstrapping-ssh-trust-via-aws-ssm)).
 * The Session Manager plugin installed (`session-manager-plugin --version`).
 
 Then:
@@ -525,21 +536,20 @@ Then:
 uv run benchops server add --alias staging-ssm --connection-type ssm \
   --user ec2-user --bench-path /home/ec2-user/frappe-bench --aws-region <region>
 
-uv run benchops auth setup-keys staging-ssm
 uv run benchops server check staging-ssm
 
 ```
 
-`setup-keys` should print progress and finish with "SSH trust established." Confirm on the instance itself (via the EC2 Instance Connect console, or `aws ssm start-session --target i-...`) that `~/.ssh/authorized_keys` for that user now contains a line ending in `benchops_ed25519`, owned by that user, with `600` permissions.
+Every step should show ✓; the "Shell session" line shows which user the session runs as. (For `ssm-ssh`, run `benchops auth setup-keys staging-ssm` before the check.)
 
-Then exercise the actual tunnel:
+Then exercise a real command:
 
 ```bash
 uv run benchops deploy <your_app> staging-ssm --site <your-site>
 
 ```
 
-While that's running, in another terminal you can confirm the tunnel is real:
+While that's running, in another terminal you can confirm the session is real:
 
 ```bash
 ps aux | grep session-manager-plugin                 # Linux/macOS

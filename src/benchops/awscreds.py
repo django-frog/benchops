@@ -62,6 +62,14 @@ def aws_session(profile: str | None = None, region: str | None = None) -> boto3.
     raise AwsCredentialsError(f"AWS profile '{profile}' has no usable credentials{detail}")
 
 
+def available_profiles() -> list[str]:
+    """Profile names from ~/.aws/config and ~/.aws/credentials."""
+    try:
+        return sorted(boto3.Session().available_profiles)
+    except botocore.exceptions.BotoCoreError:
+        return []
+
+
 def _profile_region(profile: str | None) -> str | None:
     """The region set on a profile in ~/.aws/config, without touching its
     credentials (which may not be resolvable outside aws-vault)."""

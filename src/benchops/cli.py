@@ -1,9 +1,11 @@
 """CLI entry point for benchops."""
 
+import os
 import sys
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 
+import botocore.exceptions
 import typer
 from prompt_toolkit import prompt
 from prompt_toolkit.formatted_text import HTML
@@ -12,6 +14,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from benchops.auth import AuthManager, KeyringUnavailableError
+from benchops.awscreds import available_profiles
 from benchops.backups import BackupSourceError, S3Backups, human_size
 from benchops.clone import DEFAULT_JOBS, CloneCommand
 from benchops.check import CheckCommand
@@ -23,7 +26,7 @@ from benchops.logs import LogsCommand, LogType
 from benchops.projects import load_manifest, validate_project
 from benchops.restore import RestoreCommand
 from benchops.runner import BenchOpsConnectionError
-from benchops.ssm import SsmError, list_managed_instances, session_for
+from benchops.ssm import SsmError, explain_client_error, list_managed_instances, session_for
 from benchops.status import StatusCommand
 from benchops.uninstall import UninstallCommand
 from benchops.vcs.credentials import TokenStore, parse_credential_request, token_env_var
@@ -46,10 +49,12 @@ class LocalHookPhase(str, Enum):
     post_restore = "post-restore"
 
 
-class ConnectionType(str, Enum):
-    """Supported transports for reaching a configured server."""
+class ConnectionType(StrEnum):
+    """Supported transports for reaching a configured server. A StrEnum, so
+    prompts show its default as "ssh" rather than "ConnectionType.ssh"."""
     ssh = "ssh"
     ssm = "ssm"
+    ssm_ssh = "ssm-ssh"
 
 
 class GitProvider(str, Enum):
@@ -139,22 +144,23 @@ def add_server(
     connection_type: ConnectionType = typer.Option(
         ConnectionType.ssh,
         prompt="Connection type",
-        help="How benchops should reach this server ('ssh' for direct SSH, 'ssm' for AWS Systems Manager).",
+        help="How benchops reaches this server: 'ssh' (direct SSH), 'ssm' (AWS Session Manager, no SSH at all), "
+        "or 'ssm-ssh' (SSH tunneled through Session Manager).",
     ),
-    user: str = typer.Option(..., prompt="SSH user", help="SSH username."),
+    user: str = typer.Option(..., prompt="Remote user", help="User that runs bench commands on the server."),
     bench_path: str = typer.Option(..., prompt="Remote bench path", help="Path to the bench directory on the server."),
     host: str | None = typer.Option(
-        None, help="Hostname or IP address (asked for ssh; for ssm it is only a label and defaults to the instance)."
+        None, help="Hostname or IP address (asked for ssh; for ssm/ssm-ssh only a label, defaulting to the instance)."
     ),
-    port: int | None = typer.Option(None, help="SSH port (default: 22; for ssm, sshd's port on the instance)."),
+    port: int | None = typer.Option(None, help="SSH port (default: 22; for ssm-ssh, sshd's port on the instance; unused for ssm)."),
     instance_id: str | None = typer.Option(
-        None, help="EC2 instance ID (ssm only). Omit it to pick from the instances registered with SSM."
+        None, help="EC2 instance ID (ssm/ssm-ssh). Omit it to pick from the instances registered with SSM."
     ),
     aws_profile: str | None = typer.Option(
-        None, help="AWS profile to use (ssm only). aws-vault profiles work too."
+        None, help="AWS profile to use (ssm/ssm-ssh); asked for when picking the instance. aws-vault profiles work too."
     ),
     aws_region: str | None = typer.Option(
-        None, help="AWS region the instance lives in (ssm only; default: the profile's region)."
+        None, help="AWS region the instance lives in (ssm/ssm-ssh; default: the profile's region)."
     ),
 ) -> None:
     """Add or update a configured server. Updating keeps its hooks and key."""
@@ -165,6 +171,8 @@ def add_server(
             port = typer.prompt("SSH port", default=22, type=int)
     else:
         if not instance_id:
+            if aws_profile is None:
+                aws_profile = _pick_aws_profile()
             instance_id = _pick_ssm_instance(aws_profile, aws_region)
         host = host or instance_id
         port = port or 22
@@ -187,22 +195,56 @@ def add_server(
     console.print(f"[green]Server '{alias}' saved to configuration.[/green]")
 
     server = ConfigManager().get_server(alias) or {}
-    if not server.get("private_key_path"):
+    if connection_type == ConnectionType.ssm or server.get("private_key_path"):
+        console.print(f"[dim]Next: 'benchops server check {alias}'.[/dim]")
+    else:
         auth_step = (
             f"benchops auth setup-keys {alias}"
-            if connection_type == ConnectionType.ssm
+            if connection_type == ConnectionType.ssm_ssh
             else f"benchops server set-auth {alias}"
         )
         console.print(f"[dim]Next: '{auth_step}', then 'benchops server check {alias}'.[/dim]")
-    else:
-        console.print(f"[dim]Next: 'benchops server check {alias}'.[/dim]")
+
+
+def _pick_aws_profile() -> str | None:
+    """Ask which AWS profile to use. Under aws-vault the environment decides;
+    Enter keeps the default credential chain (which, on an EC2 machine, is
+    that machine's own role — rarely what you want)."""
+    vault_profile = os.environ.get("AWS_VAULT")
+    if vault_profile:
+        console.print(f"[dim]Using aws-vault profile '{vault_profile}'.[/dim]")
+        return vault_profile
+    profiles = available_profiles()
+    if not profiles:
+        return None
+
+    console.print("AWS profiles:")
+    for number, name in enumerate(profiles, 1):
+        console.print(f"  [bold]{number}[/bold]  {escape(name)}")
+    while True:
+        choice = typer.prompt(
+            "AWS profile (number or name, Enter for the default credentials)", default="", show_default=False
+        ).strip()
+        if not choice:
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(profiles):
+            return profiles[int(choice) - 1]
+        if choice in profiles:
+            return choice
+        console.print(f"[red]Enter a number from 1 to {len(profiles)}, a profile name, or nothing.[/red]")
 
 
 def _pick_ssm_instance(aws_profile: str | None, aws_region: str | None) -> str:
     """Let the user pick an instance registered with SSM, falling back to
     typing the ID when the instances can't be listed."""
     try:
-        instances = list_managed_instances(session_for({"aws_profile": aws_profile, "aws_region": aws_region}))
+        session = session_for({"aws_profile": aws_profile, "aws_region": aws_region})
+        identity = session.client("sts").get_caller_identity()["Arn"]
+        console.print(f"[dim]AWS identity: {identity} in {session.region_name or 'the default region'}[/dim]")
+        instances = list_managed_instances(session)
+    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+        console.print(f"[yellow]Could not use these AWS credentials: {escape(explain_client_error(exc, '*', 'sts:GetCallerIdentity'))}[/yellow]")
+        return typer.prompt("EC2 instance ID").strip()
     except SsmError as exc:
         console.print(f"[yellow]Could not list SSM-managed instances: {escape(str(exc))}[/yellow]")
         return typer.prompt("EC2 instance ID").strip()
@@ -381,10 +423,16 @@ def setup_keys(
         console.print(f"[red]Error: No server found with alias '{alias}'.[/red]")
         raise typer.Exit(1)
 
-    if server_config.get("connection_type") != "ssm":
+    if server_config.get("connection_type") == "ssm":
         console.print(
-            f"[red]Error: '{alias}' is not configured with connection_type 'ssm'. "
-            "Key provisioning via SSM requires connection_type = 'ssm'.[/red]"
+            f"[green]'{alias}' uses connection_type 'ssm': commands run in an SSM session, "
+            "so no SSH key is needed.[/green]"
+        )
+        return
+    if server_config.get("connection_type") != "ssm-ssh":
+        console.print(
+            f"[red]Error: '{alias}' is not configured with connection_type 'ssm-ssh'. "
+            "Key provisioning via SSM is for SSH tunneled through SSM.[/red]"
         )
         raise typer.Exit(1)
 

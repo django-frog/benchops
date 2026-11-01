@@ -1,11 +1,10 @@
 """Uninstallation command logic."""
 
 import typer
-from invoke.exceptions import UnexpectedExit
 from rich.console import Console
 
 from benchops.base import BaseCommand
-from benchops.runner import BenchOpsConnectionError
+from benchops.runner import BenchOpsCommandError, BenchOpsConnectionError
 
 console = Console()
 
@@ -39,6 +38,6 @@ class UninstallCommand(BaseCommand):
 
                 console.print(f"[green]Successfully executed uninstall hooks for '{self.app_name}' on '{self.server_alias}'.[/green]")
 
-            except (BenchOpsConnectionError, UnexpectedExit) as exc:
+            except (BenchOpsConnectionError, BenchOpsCommandError) as exc:
                 console.print(f"[red]Uninstallation failed: {exc}[/red]")
                 raise typer.Exit(1)

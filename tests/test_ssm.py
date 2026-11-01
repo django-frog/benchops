@@ -126,8 +126,16 @@ def client_error(code, message="nope"):
 
 
 def test_access_denied_names_the_permission_and_the_document():
-    text = explain_client_error(client_error("AccessDeniedException"), "i-abc", "ssm:StartSession")
+    text = explain_client_error(
+        client_error("AccessDeniedException"), "i-abc", "ssm:StartSession", "AWS-StartPortForwardingSession"
+    )
     assert "ssm:StartSession" in text and "instance/i-abc" in text and "AWS-StartPortForwardingSession" in text
+    assert "document" not in explain_client_error(client_error("AccessDeniedException"), "i-abc", "ssm:StartSession")
+
+
+def test_describe_instance_information_cannot_be_scoped_to_an_instance():
+    text = explain_client_error(client_error("AccessDeniedException"), "*", "ssm:DescribeInstanceInformation")
+    assert '"*"' in text and "instance/" not in text
 
 
 @pytest.mark.parametrize(

@@ -4,7 +4,6 @@ server and a fake S3 — and that secrets never reach the terminal."""
 import shlex
 
 import pytest
-from invoke.exceptions import UnexpectedExit
 from typer.testing import CliRunner
 
 from benchops import cli, restore
@@ -29,17 +28,6 @@ class FakeS3:
 
     def presign(self, key, expires=3600):
         return f"https://bucket.s3.amazonaws.com/{key}?X-Amz-Signature=secret"
-
-
-class FakeResult:
-    def __init__(self, exited):
-        self.exited = exited
-        self.command = "the command"
-        self.stdout = self.stderr = ""
-        self.pty = False
-        self.hide = ()
-        self.env = {}
-        self.encoding = "utf-8"
 
 
 class FakeRunner:
@@ -88,7 +76,7 @@ class FakeRunner:
     def run(self, command, cwd=None, interactive=False):
         self.runs.append(command)
         if self.fail_on and self.fail_on in command:
-            raise UnexpectedExit(FakeResult(2))
+            raise BenchOpsCommandError(2)
 
     def put(self, local_path, remote_path):
         with open(local_path) as f:
