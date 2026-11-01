@@ -5,8 +5,8 @@ description: Deploy, sync and inspect Frappe apps on shared staging servers with
 
 # BenchOps for agents
 
-Written for **benchops 0.22.x**. Run `benchops --version` once per session.
-- On **0.21 or older**, `--plan-only` and `--json` don't exist. Ask the user to upgrade (`uv tool upgrade benchops`). If they can't, preview by running the deploy without `--yes` and with `< /dev/null`: the plan prints, the prompt aborts with exit 1, and nothing is applied.
+Written for **benchops 0.23.x**. Run `benchops --version` once per session.
+- On **0.22**, the skill works, but `skill install` doesn't add the permission rules yet. On **0.21 or older**, `--plan-only` and `--json` don't exist. Ask the user to upgrade (`uv tool upgrade benchops`). If they can't, preview by running the deploy without `--yes` and with `< /dev/null`: the plan prints, the prompt aborts with exit 1, and nothing is applied.
 - On a **newer** version, run `benchops <command> --help` before relying on the flags below.
 
 BenchOps moves a developer's git work from their local Frappe bench to a shared staging server. Several developers and the business team share staging. **Every deploy changes a shared environment, so the safety rules below are mandatory.**
@@ -45,10 +45,16 @@ Run benchops from the **bench root**: the directory that contains `apps/` and `s
 ## Running commands from an agent
 
 - Deploy and sync run a local `yarn install` and `bench build` and upload a package, so they take minutes. Give the Bash tool a long timeout (10 min) or run them in the background.
-- The commands in this skill are bash. On Windows, Claude Code runs them in Git Bash, where `< /dev/null` and `VAR=1 command` work as shown.
+- The commands in this skill are bash. On Windows, Claude Code runs them in Git Bash, where `< /dev/null` works as shown.
 - **Use `--json`** for `deploy`, `sync` and `status`. Stdout is then exactly one JSON document; the human-readable plan, progress and hook output go to stderr. Read the JSON for decisions. Use stderr only to explain things to the user or to diagnose a failure.
 - `--json` never prompts, so `deploy` and `sync` need `--plan-only` (preview) or `--yes` (apply) with it.
-- Set `BENCHOPS_NO_UPDATE_CHECK=1`, and add `< /dev/null` to every benchops command. If any command does prompt, it then aborts instead of hanging.
+- **Start every command with `benchops` itself.** Don't put an environment variable (`VAR=1 benchops ...`), a `cd ... &&`, `bash -c`, or a full path in front of it. Run it from the bench root as your working directory. Claude Code's permission rules match the command text, and read-only commands are only pre-approved when the command starts with `benchops`. The update notice goes to stderr, so it never mixes into the JSON.
+- Add `< /dev/null` to every benchops command. If any command does prompt, it then aborts instead of hanging.
+- `benchops skill install` adds permission rules to Claude Code's settings:
+  - **deny:** `--force`, `--break-lock` and `restore`.
+  - **ask:** `deploy`/`sync` with `--yes` or `-y`, `--overwrite`, `execute`, and anything that changes servers or configuration. The developer is asked in addition to your own confirmation. That's expected; don't try to avoid it.
+  - **allow** (no prompt): `status`, `--plan-only`, `logs --lines` and the other read-only commands.
+  If a command is **denied**, tell the user and give them the command to run themselves. Never retry it in another form (`bash -c`, a full path, other flags) to get past a rule.
 - **Always pass `--lines N` to `benchops logs`** (for example `benchops logs <server> --type web.error.log --lines 200 < /dev/null`). That prints the last lines and exits. Without `--lines` it follows the logs until Ctrl+C, which you can't send. Don't wrap it in `timeout` either: on Windows, `timeout` can be a different program that only waits.
 - Never run commands that open an editor or ask for secrets: `server edit-hooks`, `local edit-hooks`, `server set-auth`, `git login` without `--token-stdin`, and `server add` without every option. Give the command to the user to run themselves (`! benchops ...`).
 
@@ -66,7 +72,7 @@ git fetch --quiet && git status -sb | head -1   # behind upstream?
 
 **2. Preview** with `--plan-only`. It builds, uploads and computes the plan, then stops. Nothing is applied and nothing is asked:
 ```bash
-BENCHOPS_NO_UPDATE_CHECK=1 benchops deploy <app> <server> --site <site> --label <TASK> --plan-only --json < /dev/null
+benchops deploy <app> <server> --site <site> --label <TASK> --plan-only --json < /dev/null
 ```
 Check `outcome` in the JSON:
 - `planned`: continue to step 3.
@@ -85,7 +91,7 @@ If `frontend_unshipped` is not empty, tell the user. Those frontend files have c
 
 **4. Ask for confirmation**, then apply with the same arguments, using `--yes` in place of `--plan-only`:
 ```bash
-BENCHOPS_NO_UPDATE_CHECK=1 benchops deploy <app> <server> --site <site> --label <TASK> --yes --skip-build --json < /dev/null
+benchops deploy <app> <server> --site <site> --label <TASK> --yes --skip-build --json < /dev/null
 ```
 `--skip-build` is safe here only because the preview just built the app and nothing changed since. Drop it if any file changed after the preview.
 

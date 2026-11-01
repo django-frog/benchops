@@ -14,10 +14,11 @@ unless --force).
 import hashlib
 import os
 import re
-import tempfile
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
+
+from benchops.claude_permissions import atomic_write
 
 SKILL_NAME = "benchops"
 PACKAGE = "benchops"
@@ -33,6 +34,11 @@ def claude_dir() -> Path:
     ~/.claude (%USERPROFILE%\\.claude on Windows)."""
     configured = os.environ.get("CLAUDE_CONFIG_DIR")
     return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+def settings_path() -> Path:
+    """Claude Code's user settings file."""
+    return claude_dir() / "settings.json"
 
 
 def skill_path() -> Path:
@@ -94,19 +100,6 @@ def _refusal(found: Installed) -> str | None:
     return None
 
 
-def _write(path: Path, text: str) -> None:
-    """Write UTF-8 with LF line endings on every OS, atomically."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".SKILL.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(text.encode("utf-8"))
-        os.replace(tmp, path)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
-
-
 def _remove_link(found: Installed) -> None:
     """Remove a symlinked skill without touching what it points at."""
     for candidate in (found.path, found.path.parent):
@@ -128,7 +121,7 @@ def install(version: str, force: bool = False) -> tuple[Path, str | None]:
         if found.symlink:
             _remove_link(found)
         replaced = found.version or "an unmanaged copy"
-    _write(path, stamp(bundled_skill(), version))
+    atomic_write(path, stamp(bundled_skill(), version))
     return path, replaced
 
 

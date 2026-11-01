@@ -299,6 +299,16 @@ benchops skill status      # installed? for which version?
 benchops skill uninstall
 ```
 
+`skill install` also adds permission rules to Claude Code's user settings (`~/.claude/settings.json`), so Claude Code enforces the safety rules even if Claude ignores the skill. The rules apply in every permission mode:
+
+| Rule | Commands |
+|---|---|
+| **deny** (never runs) | `--force`, `--break-lock`, `restore` |
+| **ask** (you confirm) | `deploy`/`sync` with `--yes`/`-y`, `--overwrite`, `execute`, `install`/`uninstall`, `server add/remove/set-auth/…-hooks`, `local`, `auth`, `backup source`, `skill install/uninstall` |
+| **allow** (no prompt) | `status`, `deploy`/`sync --plan-only`, `logs --lines`, `server list`, `server check`, `backup list`, `version`, `skill status` |
+
+Your existing settings and rules are kept, and the file is backed up first (`settings.json.benchops-backup`). If it isn't valid JSON, it's left untouched and the rules are printed for you to paste. `skill uninstall` removes only the rules benchops added. Pass `--no-permissions` to skip all of this. In `claude -p` (headless) runs, anything an ask rule covers is denied, so unattended runs can't change a server. These rules match the command text: they stop mistakes, not someone deliberately working around them (`bash -c …`).
+
 The skill describes this version's flags and JSON, so run `benchops skill install` again after every upgrade — every command reminds you when the installed skill is from an older version. A copy you edited, made by hand or symlinked is left alone unless you pass `--force`. `$CLAUDE_CONFIG_DIR` is respected.
 
 Then tell Claude where each app deploys, in `CLAUDE.md` at your bench root (or `~/.claude/CLAUDE.md`):
@@ -501,7 +511,7 @@ The apps installed in the backup must also be installed on the bench, ideally at
 * `benchops install <app_name> <server_alias> --site <site_name>`: Executes the install-remote hooks.
 * `benchops uninstall <app_name> <server_alias> --site <site_name>`: Executes the uninstall-remote hooks.
 * `benchops logs <server_alias> [--type frappe.log|web.error.log|worker.error.log] [--lines N]`: Tails bench logs in real time (Ctrl+C to stop), or prints the last N lines and exits.
-* `benchops skill install|status|uninstall [--force]`: Installs the Claude Code skill for this version — see [Using BenchOps with Claude Code](#using-benchops-with-claude-code).
+* `benchops skill install|status|uninstall [--force] [--no-permissions]`: Installs the Claude Code skill for this version and its permission rules — see [Using BenchOps with Claude Code](#using-benchops-with-claude-code).
 * `benchops execute <server_alias> --site <site_name> <method> [--args <json>] [--kwargs <json>]`: Runs a single Python method via `bench execute` — no interactive shell.
 
 * `benchops restore <source> --site <site> (--server <alias> | --local [--bench PATH]) [--from-site ...] [--at latest|STAMP] [--new-site] [--no-files] [--admin-password ...] [--skip-safety-backup] [--yes]`: Restores a site from an S3 backup — see [Restoring a Site from S3](#restoring-a-site-from-s3).

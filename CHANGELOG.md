@@ -5,6 +5,22 @@ version, whether a newer one is available, and what changed.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-01
+
+### Added
+- `benchops skill install` also adds permission rules to Claude Code's user settings (`~/.claude/settings.json`, or under `$CLAUDE_CONFIG_DIR`):
+  - **deny** `--force`, `--break-lock` and `restore` in every mode.
+  - **ask** before `deploy`/`sync` with `--yes` or `-y`, `--overwrite`, `execute`, `install`/`uninstall`, and changes to servers, hooks or credentials.
+  - **allow** read-only commands (`status`, `--plan-only`, `logs --lines`, `server list`/`check`, `version`) without prompting.
+
+  Rules already in the file are kept, settings are backed up before every change (`settings.json.benchops-backup`), and a file that isn't valid JSON is left untouched with the rules printed to paste. `skill uninstall` removes only the rules benchops added, and an upgrade drops rules a newer version no longer ships. `--no-permissions` skips all of it. `skill status` reports whether the rules are in place.
+
+### Changed
+- The Claude skill tells Claude to start every command with `benchops`, with no `VAR=value` prefix, so the allow rules match. It also tells Claude never to work around a denied command.
+
+### Fixed
+- The installed `SKILL.md` was readable only by its owner (mode 0600); it now gets the usual file permissions.
+
 ## [0.22.0] - 2026-11-01
 
 ### Added

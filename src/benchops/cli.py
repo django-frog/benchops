@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from benchops import claude_permissions
 from benchops import skill as claude_skill
 from benchops.auth import AuthManager, KeyringUnavailableError
 from benchops.awscreds import available_profiles
@@ -1219,13 +1220,28 @@ if __name__ == "__main__":
 # --------------------------------------------------------------------------- Claude skill
 
 
+def _describe_rules(change: "claude_permissions.Change") -> str:
+    added = sum(len(v) for v in change.added.values())
+    removed = sum(len(v) for v in change.removed.values())
+    parts = [f"{added} added"] if added else []
+    if removed:
+        parts.append(f"{removed} outdated removed")
+    return ", ".join(parts) if parts else "already up to date"
+
+
 @skill_app.command("install")
 def skill_install(
     force: bool = typer.Option(
         False, "--force", help="Replace a copy that was edited, made by hand, or is a symbolic link."
     ),
+    permissions: bool = typer.Option(
+        True,
+        "--permissions/--no-permissions",
+        help="Also add benchops permission rules to Claude Code's settings.json (deny the dangerous flags, "
+        "ask before changing a server, allow read-only commands).",
+    ),
 ) -> None:
-    """Install or update the Claude Code skill for this version of benchops."""
+    """Install or update the Claude Code skill for this version of benchops, with its permission rules."""
     version = installed_version()
     try:
         path, replaced = claude_skill.install(version, force=force)
@@ -1238,6 +1254,28 @@ def skill_install(
         console.print(f"[green]Updated the Claude skill from {replaced} to benchops {version}: {path}[/green]")
     else:
         console.print(f"[green]Installed the Claude skill for benchops {version}: {path}[/green]")
+
+    rules_ok = True
+    if permissions:
+        settings = claude_skill.settings_path()
+        try:
+            change = claude_permissions.install(settings)
+        except (claude_permissions.SettingsError, OSError) as exc:
+            rules_ok = False
+            console.print(f"[yellow]Permission rules not added: {escape(str(exc))}[/yellow]")
+            console.print("Fix the file, then run 'benchops skill install' again, or add this to it by hand:\n")
+            console.print(escape(claude_permissions.snippet()), highlight=False)
+        else:
+            console.print(f"[green]Permission rules in {settings}: {_describe_rules(change)}.[/green]")
+            if change.backup:
+                console.print(f"[dim]Previous settings saved as {change.backup}.[/dim]")
+            console.print(
+                "[dim]Claude Code now never runs --force, --break-lock or restore, asks before anything that "
+                "changes a server, and runs read-only benchops commands without asking.[/dim]"
+            )
+    else:
+        console.print("[dim]Permission rules skipped (--no-permissions).[/dim]")
+
     console.print(
         "\nClaude Code picks it up in new sessions.\n"
         "So Claude knows where each app deploys, add a table like this\n"
@@ -1245,13 +1283,15 @@ def skill_install(
     )
     console.print(escape(claude_skill.TARGETS_SNIPPET), highlight=False)
     console.print("[dim]Run 'benchops skill install' again after upgrading benchops.[/dim]")
+    if not rules_ok:
+        raise typer.Exit(1)
 
 
 @skill_app.command("uninstall")
 def skill_uninstall(
     force: bool = typer.Option(False, "--force", help="Remove it even if it was edited or not installed by benchops."),
 ) -> None:
-    """Remove the Claude Code skill."""
+    """Remove the Claude Code skill and the permission rules benchops added."""
     try:
         path = claude_skill.uninstall(force=force)
     except (claude_skill.SkillError, OSError) as exc:
@@ -1262,23 +1302,46 @@ def skill_uninstall(
     else:
         console.print(f"[green]Removed the Claude skill: {path}[/green]")
 
+    settings = claude_skill.settings_path()
+    try:
+        change = claude_permissions.uninstall(settings)
+    except (claude_permissions.SettingsError, OSError) as exc:
+        console.print(f"[yellow]Permission rules left in place: {escape(str(exc))}[/yellow]")
+        raise typer.Exit(1)
+    removed = sum(len(v) for v in change.removed.values())
+    if removed:
+        console.print(f"[green]Removed {removed} permission rule(s) benchops had added to {settings}.[/green]")
+
 
 @skill_app.command("status")
 def skill_status() -> None:
-    """Show whether the Claude Code skill is installed, and for which version."""
+    """Show whether the Claude Code skill and its permission rules are installed."""
     version = installed_version()
     found = claude_skill.inspect_installed()
     if found is None:
         console.print(f"Not installed (would go to {claude_skill.skill_path()}). Run 'benchops skill install'.")
-        return
-    console.print(f"Installed at {found.path}")
-    if found.symlink:
-        console.print("[yellow]It is a symbolic link, not managed by benchops.[/yellow]")
-    elif found.version is None:
-        console.print("[yellow]Not installed by benchops (a hand-made copy); 'skill install --force' replaces it.[/yellow]")
-    elif found.version != version:
-        console.print(f"[yellow]From benchops {found.version}; you have {version}. Run 'benchops skill install'.[/yellow]")
     else:
-        console.print(f"[green]Up to date (benchops {version}).[/green]")
-    if found.modified:
-        console.print("[yellow]Edited since it was installed; 'skill install' will ask for --force.[/yellow]")
+        console.print(f"Installed at {found.path}")
+        if found.symlink:
+            console.print("[yellow]It is a symbolic link, not managed by benchops.[/yellow]")
+        elif found.version is None:
+            console.print("[yellow]Not installed by benchops (a hand-made copy); 'skill install --force' replaces it.[/yellow]")
+        elif found.version != version:
+            console.print(f"[yellow]From benchops {found.version}; you have {version}. Run 'benchops skill install'.[/yellow]")
+        else:
+            console.print(f"[green]Up to date (benchops {version}).[/green]")
+        if found.modified:
+            console.print("[yellow]Edited since it was installed; 'skill install' will ask for --force.[/yellow]")
+
+    settings = claude_skill.settings_path()
+    absent = claude_permissions.missing(settings)
+    total = sum(len(v) for v in claude_permissions.RULES.values())
+    if absent is None:
+        console.print(f"[yellow]Permission rules: can't read {settings} (not valid JSON).[/yellow]")
+    elif not absent:
+        console.print(f"[green]Permission rules: all {total} in {settings}.[/green]")
+    else:
+        console.print(
+            f"[yellow]Permission rules: {len(absent)} of {total} missing from {settings}; "
+            "run 'benchops skill install'.[/yellow]"
+        )
