@@ -5,6 +5,11 @@ version, whether a newer one is available, and what changed.
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-11-01
+
+### Fixed
+- `execute` rejects anything that isn't a dotted Python method path before connecting, and points bench commands like `list-apps` to their method (`frappe.get_installed_apps`) instead of failing remotely with a confusing `NameError`.
+
 ## [0.21.0] - 2026-11-01
 
 ### Added

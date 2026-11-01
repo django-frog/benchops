@@ -13,11 +13,36 @@ import shlex
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from benchops.base import BaseCommand
 from benchops.runner import BenchOpsCommandError, BenchOpsConnectionError
 
 console = Console()
+
+# Bench subcommands people reach for, and the Python method that answers
+# the same question through `bench execute`.
+BENCH_COMMAND_EQUIVALENTS = {
+    "list-apps": "frappe.get_installed_apps",
+    "version": "frappe.utils.change_log.get_versions",
+    "clear-cache": "frappe.clear_cache",
+}
+
+
+def method_problem(method: str) -> str | None:
+    """Why `method` can't be a dotted Python path, or None if it can be.
+
+    `bench execute` falls back to eval() when the import fails, so a bench
+    subcommand like `list-apps` turns into a confusing NameError remotely.
+    """
+    parts = method.split(".")
+    if len(parts) >= 2 and all(part.isidentifier() for part in parts):
+        return None
+    message = f"'{method}' is not a Python method path. `execute` runs a method by its dotted path, not a bench command."
+    equivalent = BENCH_COMMAND_EQUIVALENTS.get(method)
+    if equivalent:
+        return f"{message} For '{method}', use: {equivalent}"
+    return f"{message} For example: frappe.get_installed_apps"
 
 
 class ExecuteCommand(BaseCommand):
@@ -55,6 +80,10 @@ class ExecuteCommand(BaseCommand):
         return " ".join(shlex.quote(part) for part in parts)
 
     def execute(self) -> None:
+        problem = method_problem(self.method)
+        if problem:
+            console.print(f"[red]Error:[/red] {escape(problem)}")
+            raise typer.Exit(1)
         self._validate_json()
         server_config = self._get_server_config()
         command = self._build_command()
