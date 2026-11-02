@@ -55,6 +55,28 @@ def test_profile_with_native_credentials_is_used_as_is(fake_boto):
     assert session.profile_name == "dev" and session.region_name == "ap-south-1"
 
 
+class MachineCredentials:
+    method = "iam-role"
+
+
+def test_profile_falling_back_to_the_instance_role_is_refused(fake_boto):
+    fake_boto.credentials = MachineCredentials()
+    with pytest.raises(AwsCredentialsError, match="instance role"):
+        aws_session("dev", None)
+
+
+def test_profile_falling_back_to_the_instance_role_uses_aws_vault(fake_boto, monkeypatch):
+    fake_boto.credentials = MachineCredentials()
+    monkeypatch.setattr("benchops.awscreds.shutil.which", lambda name: "/usr/bin/aws-vault")
+    monkeypatch.setattr("benchops.awscreds._aws_vault_session", lambda profile, region: ("vault", profile))
+    assert aws_session("dev", None) == ("vault", "dev")
+
+
+def test_the_default_chain_may_use_the_instance_role(fake_boto):
+    fake_boto.credentials = MachineCredentials()
+    assert aws_session(None, None).profile_name is None  # no profile named: the machine's role is what was asked for
+
+
 def test_under_aws_vault_the_environment_wins_over_the_profile(fake_boto, monkeypatch):
     monkeypatch.setenv("AWS_VAULT", "dev")
     fake_boto.profile_region = "eu-west-1"

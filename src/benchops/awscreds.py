@@ -25,6 +25,11 @@ import botocore.exceptions
 AWS_VAULT_ENV = "AWS_VAULT"
 AWS_VAULT_EXPORT_TIMEOUT_SECONDS = 300
 
+# Credential methods botocore reaches only after the profile itself produced
+# nothing: the EC2 instance role (IMDS) and the ECS/EKS container role. A
+# named profile resolving to one of these is someone else's identity.
+MACHINE_CREDENTIAL_METHODS = {"iam-role", "container-role"}
+
 
 class AwsCredentialsError(Exception):
     """Raised when no usable AWS credentials can be found for a profile."""
@@ -46,10 +51,14 @@ def aws_session(profile: str | None = None, region: str | None = None) -> boto3.
         return boto3.Session(region_name=region)
 
     native_error: Exception | None = None
+    fell_back_to_machine = False
     try:
         session = boto3.Session(profile_name=profile, region_name=region)
-        if session.get_credentials() is not None:
-            return session
+        credentials = session.get_credentials()
+        if credentials is not None:
+            if getattr(credentials, "method", None) not in MACHINE_CREDENTIAL_METHODS:
+                return session
+            fell_back_to_machine = True
     except botocore.exceptions.ProfileNotFound as exc:
         raise AwsCredentialsError(f"AWS profile '{profile}' is not defined in ~/.aws/config.") from exc
     except (botocore.exceptions.BotoCoreError, ValueError) as exc:
@@ -58,6 +67,12 @@ def aws_session(profile: str | None = None, region: str | None = None) -> boto3.
     if shutil.which("aws-vault"):
         return _aws_vault_session(profile, region)
 
+    if fell_back_to_machine:
+        raise AwsCredentialsError(
+            f"AWS profile '{profile}' has no credentials of its own, so AWS would fall back to this machine's "
+            f"instance role instead of your identity. Give the profile your access keys "
+            f"('aws configure --profile {profile}'), or install aws-vault and add them there."
+        )
     detail = f": {native_error}" if native_error else "."
     raise AwsCredentialsError(f"AWS profile '{profile}' has no usable credentials{detail}")
 

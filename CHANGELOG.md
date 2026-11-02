@@ -5,6 +5,12 @@ version, whether a newer one is available, and what changed.
 
 ## [Unreleased]
 
+## [0.23.1] - 2026-11-02
+
+### Fixed
+- A named AWS profile with no credentials of its own no longer silently runs as the machine's EC2 instance role (or container role). benchops uses aws-vault for it when installed, and otherwise says the profile needs credentials, instead of failing later with access-denied errors for the wrong identity.
+- `skill install` resets the 0600 mode a 0.22.0 install left on `SKILL.md`.
+
 ## [0.23.0] - 2026-11-01
 
 ### Added
